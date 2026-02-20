@@ -10,18 +10,77 @@ const io = new Server(server, {
   cors: {
     origin: [
       'https://bodrumbot.github.io',
-      'https://bodrumbot.github.io/11',
+      'https://bodrumbot.github.io/111',
       'http://localhost:3000',
       'http://localhost:5000',
-      'http://127.0.0.1:5500'
+      'http://127.0.0.1:5500',
+      '*'
     ],
-    methods: ["GET", "POST"],
-    credentials: true
-  }
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"]
+  },
+  allowEIO3: true,
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 // ==========================================
-// PostgreSQL ulanish - DATABASE_PUBLIC_URL bilan
+// CORS - BARCHA SO'ROVLAR UCHUN
+// ==========================================
+app.use((req, res, next) => {
+  const allowedOrigins = [
+    'https://bodrumbot.github.io',
+    'https://bodrumbot.github.io/111',
+    'http://localhost:3000',
+    'http://localhost:5000',
+    'http://127.0.0.1:5500'
+  ];
+  
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes(origin) || !origin) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+  }
+  
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Max-Age', '86400');
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+// Express CORS
+app.use(cors({
+  origin: function(origin, callback) {
+    const allowedOrigins = [
+      'https://bodrumbot.github.io',
+      'https://bodrumbot.github.io/111',
+      'http://localhost:3000',
+      'http://localhost:5000',
+      'http://127.0.0.1:5500'
+    ];
+    
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS policy violation'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With'],
+  credentials: true,
+  preflightContinue: false,
+  optionsSuccessStatus: 204
+}));
+
+app.use(express.json());
+
+// ==========================================
+// PostgreSQL ulanish
 // ==========================================
 const pool = new Pool({
   connectionString: process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL,
@@ -30,23 +89,7 @@ const pool = new Pool({
   }
 });
 
-// Alohida LISTEN ulanishi (real-time uchun)
 let listenClient = null;
-
-app.use(cors({
-  origin: [
-    'https://bodrumbot.github.io',
-    'https://bodrumbot.github.io/11',
-    'http://localhost:3000',
-    'http://localhost:5000',
-    'http://127.0.0.1:5500'
-  ],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
-
-app.use(express.json());
 
 // ==========================================
 // BAZA YARATISH VA TRIGGERLAR
@@ -54,7 +97,6 @@ app.use(express.json());
 async function initDB() {
   const client = await pool.connect();
   try {
-    // Orders jadvali
     await client.query(`
       CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY,
@@ -80,7 +122,6 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
     `);
 
-    // Trigger funksiyasi
     await client.query(`
       CREATE OR REPLACE FUNCTION notify_order_change()
       RETURNS TRIGGER AS $$
@@ -110,7 +151,6 @@ async function initDB() {
       $$ LANGUAGE plpgsql;
     `);
 
-    // Trigger
     await client.query(`
       DROP TRIGGER IF EXISTS orders_notify_trigger ON orders;
       CREATE TRIGGER orders_notify_trigger
@@ -187,9 +227,30 @@ async function startPgListener() {
 // API ROUTES
 // ==========================================
 
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    database: 'connected',
+    cors: 'enabled'
+  });
+});
+
+// Test CORS
+app.get('/test-cors', (req, res) => {
+  res.json({ 
+    message: 'CORS is working!',
+    origin: req.headers.origin,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Yangi buyurtma
 app.post('/api/orders', async (req, res) => {
   const { order_id, name, phone, items, total, location, tg_id, payment_method = 'payme' } = req.body;
+  
+  console.log('📥 Yangi buyurtma:', order_id, name, total);
   
   try {
     const result = await pool.query(
@@ -199,9 +260,10 @@ app.post('/api/orders', async (req, res) => {
       [order_id, name, phone, JSON.stringify(items), total, location, tg_id, payment_method]
     );
     
+    console.log('✅ Buyurtma saqlandi:', result.rows[0].order_id);
     res.json({ success: true, order: result.rows[0] });
   } catch (error) {
-    console.error('Order yaratish xato:', error);
+    console.error('❌ Order yaratish xato:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -212,6 +274,7 @@ app.get('/api/orders', async (req, res) => {
     const result = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
     res.json(result.rows);
   } catch (error) {
+    console.error('❌ Orders olish xato:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -225,6 +288,7 @@ app.get('/api/orders/:order_id', async (req, res) => {
     }
     res.json(result.rows[0]);
   } catch (error) {
+    console.error('❌ Order olish xato:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -232,6 +296,8 @@ app.get('/api/orders/:order_id', async (req, res) => {
 // Status yangilash
 app.post('/api/orders/:order_id/status', async (req, res) => {
   const { status, payment_status } = req.body;
+  
+  console.log('📝 Status yangilash:', req.params.order_id, status, payment_status);
   
   try {
     let query = 'UPDATE orders SET ';
@@ -265,8 +331,10 @@ app.post('/api/orders/:order_id/status', async (req, res) => {
       return res.status(404).json({ error: 'Buyurtma topilmadi' });
     }
     
+    console.log('✅ Status yangilandi:', result.rows[0].order_id);
     res.json({ success: true, order: result.rows[0] });
   } catch (error) {
+    console.error('❌ Status yangilash xato:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -274,6 +342,8 @@ app.post('/api/orders/:order_id/status', async (req, res) => {
 // Payme callback
 app.post('/api/payment/callback', async (req, res) => {
   const { order_id, status } = req.body;
+  
+  console.log('💰 Payme callback:', order_id, status);
   
   try {
     const result = await pool.query(
@@ -290,19 +360,12 @@ app.post('/api/payment/callback', async (req, res) => {
       return res.status(404).json({ error: 'Buyurtma topilmadi' });
     }
     
-    res.json({ success: true });
+    console.log('✅ Payme callback muvaffaqiyatli');
+    res.json({ success: true, order: result.rows[0] });
   } catch (error) {
+    console.error('❌ Payme callback xato:', error);
     res.status(500).json({ error: error.message });
   }
-});
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    database: 'connected'
-  });
 });
 
 // ==========================================
@@ -310,25 +373,29 @@ app.get('/health', (req, res) => {
 // ==========================================
 
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
+  console.log('✅ Client connected:', socket.id);
   
   socket.on('join_admin', () => {
     socket.join('admin_room');
-    console.log('Admin joined:', socket.id);
+    console.log('👑 Admin joined:', socket.id);
   });
   
   socket.on('join_order', (orderId) => {
     socket.join(`order_${orderId}`);
-    console.log('Order room joined:', orderId);
+    console.log('📦 Order room joined:', orderId);
   });
   
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
+  socket.on('disconnect', (reason) => {
+    console.log('❌ Client disconnected:', socket.id, reason);
+  });
+  
+  socket.on('error', (error) => {
+    console.error('Socket xato:', error);
   });
 });
 
 // ==========================================
-// TELEGRAM BOT CHECK (har 5 sekundda)
+// TELEGRAM BOT CHECK
 // ==========================================
 
 async function checkNewOrders() {
@@ -348,7 +415,7 @@ async function checkNewOrders() {
       console.log('✅ Yangi to\'langan buyurtma:', order.order_id);
     }
   } catch (error) {
-    console.error('Tekshirish xato:', error);
+    console.error('❌ Tekshirish xato:', error);
   }
 }
 
@@ -367,11 +434,12 @@ async function start() {
     
     server.listen(PORT, () => {
       console.log(`🚀 Server ${PORT} portda ishlamoqda`);
-      console.log(`🌐 Frontend URL: https://bodrumbot.github.io/11`);
+      console.log(`🌐 Frontend URL: https://bodrumbot.github.io/111`);
       console.log(`🔌 WebSocket enabled`);
+      console.log(`📡 CORS enabled for: https://bodrumbot.github.io`);
     });
   } catch (error) {
-    console.error('Server start xato:', error);
+    console.error('❌ Server start xato:', error);
     process.exit(1);
   }
 }
