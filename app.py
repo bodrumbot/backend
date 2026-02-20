@@ -5,9 +5,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQuer
 from datetime import datetime
 import os
 from dotenv import load_dotenv
-import asyncio
-import threading
-import socketio
 import requests
 
 load_dotenv()
@@ -122,7 +119,7 @@ async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
             items = order['items']
             if isinstance(items, list):
                 for item in items:
-                    message += f"\n• {item.get('name', 'Nomalum')} x{item.get('qty', 1)}"
+                    message += f"\n• {item.get('name', 'Noma\'lum')} x{item.get('qty', 1)}"
             elif isinstance(items, dict):
                 for item_name, qty in items.items():
                     message += f"\n• {item_name} x{qty}"
@@ -147,15 +144,6 @@ async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
             # Notified qilish
             cur.execute("UPDATE orders SET notified = TRUE WHERE id = %s", (order['id'],))
             conn.commit()
-            
-            # Web App'ga ham xabar yuborish (Socket.io orqali)
-            try:
-                requests.post(f"{WEBAPP_URL}/api/notify", json={
-                    "order_id": order['order_id'],
-                    "status": "paid"
-                }, timeout=2)
-            except:
-                pass
         
         cur.close()
         conn.close()
@@ -181,14 +169,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 WHERE order_id = %s
             """, (order_id,))
             text = f"\n\n✅ <b>QABUL QILINDI</b>"
-            
-            # Web App'ga ham xabar yuborish
-            try:
-                requests.post(f"{WEBAPP_URL}/api/orders/{order_id}/status", json={
-                    "status": "accepted"
-                }, timeout=2)
-            except:
-                pass
                 
         elif action == 'reject':
             cur.execute("""
@@ -197,14 +177,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 WHERE order_id = %s
             """, (order_id,))
             text = f"\n\n❌ <b>BEKOR QILINDI</b>"
-            
-            # Web App'ga ham xabar yuborish
-            try:
-                requests.post(f"{WEBAPP_URL}/api/orders/{order_id}/status", json={
-                    "status": "rejected"
-                }, timeout=2)
-            except:
-                pass
         else:
             return
         
