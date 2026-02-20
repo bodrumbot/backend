@@ -8,21 +8,44 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
+    origin: [
+      'https://bodrumbot.github.io',
+      'https://bodrumbot.github.io/11',
+      'http://localhost:3000',
+      'http://localhost:5000',
+      'http://127.0.0.1:5500'
+    ],
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 
-// PostgreSQL ulanish
+// ==========================================
+// PostgreSQL ulanish - DATABASE_PUBLIC_URL bilan
+// ==========================================
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  connectionString: process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL,
+  ssl: { 
+    rejectUnauthorized: false 
+  }
 });
 
-// Alohida LISTEN ulanishi
+// Alohida LISTEN ulanishi (real-time uchun)
 let listenClient = null;
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://bodrumbot.github.io',
+    'https://bodrumbot.github.io/11',
+    'http://localhost:3000',
+    'http://localhost:5000',
+    'http://127.0.0.1:5500'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+}));
+
 app.use(express.json());
 
 // ==========================================
@@ -97,6 +120,9 @@ async function initDB() {
     `);
 
     console.log('✅ Baza va triggerlar tayyor');
+  } catch (error) {
+    console.error('❌ Baza yaratish xato:', error);
+    throw error;
   } finally {
     client.release();
   }
@@ -113,8 +139,8 @@ async function startPgListener() {
   }
   
   listenClient = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    connectionString: process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
     max: 1
   });
   
@@ -270,6 +296,15 @@ app.post('/api/payment/callback', async (req, res) => {
   }
 });
 
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    database: 'connected'
+  });
+});
+
 // ==========================================
 // WEBSOCKET
 // ==========================================
@@ -326,12 +361,19 @@ setInterval(checkNewOrders, 5000);
 const PORT = process.env.PORT || 3000;
 
 async function start() {
-  await initDB();
-  await startPgListener();
-  
-  server.listen(PORT, () => {
-    console.log(`🚀 Server ${PORT} portda ishlamoqda`);
-  });
+  try {
+    await initDB();
+    await startPgListener();
+    
+    server.listen(PORT, () => {
+      console.log(`🚀 Server ${PORT} portda ishlamoqda`);
+      console.log(`🌐 Frontend URL: https://bodrumbot.github.io/11`);
+      console.log(`🔌 WebSocket enabled`);
+    });
+  } catch (error) {
+    console.error('Server start xato:', error);
+    process.exit(1);
+  }
 }
 
 start().catch(console.error);
