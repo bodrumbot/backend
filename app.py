@@ -1,311 +1,293 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import logging
+import asyncio
 import psycopg2
 import psycopg2.extras
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from datetime import datetime
-import os
+from typing import Optional, Dict, Any
+
 from dotenv import load_dotenv
-import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters
+)
 
 load_dotenv()
 
-# PostgreSQL ulanish
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-def get_db():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL topilmadi!")
-    
-    # Railway internal URL lokalda ishlamaydi
-    if 'railway.internal' in DATABASE_URL:
-        # Railway'da ishlaganda
-        return psycopg2.connect(DATABASE_URL, sslmode='require')
-    else:
-        # Lokalda ishlaganda (localhost yoki public URL)
-        return psycopg2.connect(DATABASE_URL)
-
-# Web App URL (Railway'da deploy qilingan)
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bodrumbot.github.io/11")
+# Railway PostgreSQL
+DATABASE_URL = os.getenv("")
+TOKEN = os.getenv("TOKEN")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 ADMIN_URL = f"{WEBAPP_URL}/admin.html"
 
-TOKEN = os.getenv("TOKEN")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
+# Database connection
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
-def init_db():
-    """Baza jadvallarini yaratish (Web App bilan bir xil struktura)"""
-    conn = get_db()
-    cur = conn.cursor()
-    
-    # Orders jadvali (Web App bilan bir xil)
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY,
-            order_id VARCHAR(50) UNIQUE,
-            name VARCHAR(100),
-            phone VARCHAR(20),
-            items JSONB,
-            total INTEGER,
-            status VARCHAR(20) DEFAULT 'pending_payment',
-            payment_status VARCHAR(20) DEFAULT 'pending',
-            payment_method VARCHAR(20) DEFAULT 'payme',
-            location VARCHAR(100),
-            tg_id BIGINT,
-            created_at TIMESTAMP DEFAULT NOW(),
-            accepted_at TIMESTAMP,
-            rejected_at TIMESTAMP,
-            notified BOOLEAN DEFAULT FALSE
-        )
-    ''')
-    
-    # Adminlar jadvali
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS admins (
-            id SERIAL PRIMARY KEY,
-            tg_id BIGINT UNIQUE,
-            username VARCHAR(100),
-            added_at TIMESTAMP DEFAULT NOW()
-        )
-    ''')
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("✅ Baza tayyor")
+def format_price(price: int) -> str:
+    return f"{price:,}".replace(",", " ")
 
-def is_admin(user_id: int) -> bool:
-    """Tekshirish: foydalanuvchi adminmi?"""
-    if user_id == ADMIN_CHAT_ID:
-        return True
-    
+def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     try:
-        conn = get_db()
+        conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM admins WHERE tg_id = %s", (user_id,))
+        cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
         result = cur.fetchone()
         cur.close()
         conn.close()
-        return result is not None
-    except:
-        return False
+        return dict(result) if result else None
+    except Exception as e:
+        logger.error(f"Get order error: {e}")
+        return None
+
+def update_order_status(order_id: str, status: str) -> Optional[Dict[str, Any]]:
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        update_data = {'status': status}
+        if status == 'accepted':
+            update_data['accepted_at'] = datetime.utcnow().isoformat()
+        elif status == 'rejected':
+            update_data['rejected_at'] = datetime.utcnow().isoformat()
+        
+        # Build query dynamically
+        fields = []
+        values = []
+        for key, val in update_data.items():
+            fields.append(f"{key} = %s")
+            values.append(val)
+        values.append(order_id)
+        
+        query = f"UPDATE orders SET {', '.join(fields)} WHERE order_id = %s RETURNING *"
+        cur.execute(query, values)
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return dict(result) if result else None
+    except Exception as e:
+        logger.error(f"Update error: {e}")
+        return None
+
+# Polling for new orders
+last_notified_orders = set()
+last_check_time = None
 
 async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
-    """Har 5 sekundda yangi to'langan buyurtmalarni tekshirish"""
+    """Har 10 soniyada yangi buyurtmalarni tekshirish"""
+    global last_check_time
+    
     try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        conn = get_db_connection()
+        cur = conn.cursor()
         
-        # To'langan va hali xabar yuborilmagan buyurtmalar
-        cur.execute("""
-            SELECT * FROM orders 
-            WHERE payment_status = 'paid' 
-            AND status = 'pending'
-            AND (notified IS NULL OR notified = FALSE)
-        """)
+        # Query for paid + payment_pending orders
+        if last_check_time:
+            cur.execute("""
+                SELECT * FROM orders 
+                WHERE payment_status = 'paid' 
+                AND status = 'payment_pending'
+                AND created_at > %s
+                ORDER BY created_at DESC
+            """, (last_check_time,))
+        else:
+            cur.execute("""
+                SELECT * FROM orders 
+                WHERE payment_status = 'paid' 
+                AND status = 'payment_pending'
+                ORDER BY created_at DESC
+            """)
         
         orders = cur.fetchall()
-        
-        for order in orders:
-            name = order['name']
-            phone = order['phone']
-            total = order['total']
-            
-            message = f"""✅ <b>YANGI TO'LANGAN BUYURTMA!</b>
-👤 Mijoz: {name}
-📞 Telefon: +998{phone}
-💰 Summa: {total:,} so'm
-
-🍔 Mahsulotlar:"""
-            
-            items = order['items']
-            if isinstance(items, list):
-                for item in items:
-                    message += f"\n• {item.get('name', 'Nomalum')} x{item.get('qty', 1)}"
-            elif isinstance(items, dict):
-                for item_name, qty in items.items():
-                    message += f"\n• {item_name} x{qty}"
-            
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Qabul", callback_data=f"accept_{order['order_id']}"),
-                    InlineKeyboardButton("❌ Bekor", callback_data=f"reject_{order['order_id']}")
-                ],
-                [
-                    InlineKeyboardButton("🌐 Admin Panel", url=ADMIN_URL)
-                ]
-            ]
-            
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=message,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='HTML'
-            )
-            
-            # Notified qilish
-            cur.execute("UPDATE orders SET notified = TRUE WHERE id = %s", (order['id'],))
-            conn.commit()
-        
         cur.close()
         conn.close()
         
-    except Exception as e:
-        print(f"Xato: {e}")
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    try:
-        data = query.data
-        action, order_id = data.split('_', 1)
-        
-        conn = get_db()
-        cur = conn.cursor()
-        
-        if action == 'accept':
-            cur.execute("""
-                UPDATE orders 
-                SET status = 'accepted', accepted_at = NOW() 
-                WHERE order_id = %s
-            """, (order_id,))
-            text = f"\n\n✅ <b>QABUL QILINDI</b>"
+        if orders:
+            logger.info(f"📊 Yangi buyurtmalar: {len(orders)} ta")
+            
+            for order in orders:
+                order_id = order['order_id']
                 
-        elif action == 'reject':
-            cur.execute("""
-                UPDATE orders 
-                SET status = 'rejected', rejected_at = NOW() 
-                WHERE order_id = %s
-            """, (order_id,))
-            text = f"\n\n❌ <b>BEKOR QILINDI</b>"
-        else:
-            cur.close()
-            conn.close()
-            return
+                if order_id in last_notified_orders:
+                    continue
+                
+                await notify_admin(context, dict(order))
+                last_notified_orders.add(order_id)
         
+        last_check_time = datetime.utcnow().isoformat()
+        
+    except Exception as e:
+        logger.error(f"❌ Tekshirish xatosi: {e}")
+
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
+    """Admin ga yangi buyurtma haqida xabar yuborish"""
+    try:
+        items = order.get('items', [])
+        if isinstance(items, str):
+            import json
+            items = json.loads(items)
+        
+        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
+        
+        message = f"""🛎️ <b>YANGI BUYURTMA!</b>
+
+🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
+👤 Mijoz: {order.get('name')}
+📞 Telefon: +998 {order.get('phone')}
+💵 Summa: {format_price(order.get('total', 0))} so'm
+💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅
+
+🍽 Mahsulotlar:
+{items_text}
+
+⏰ {datetime.now().strftime('%H:%M:%S')}"""
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
+                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
+            ],
+            [InlineKeyboardButton("🌐 Admin Panel", web_app=WebAppInfo(url=ADMIN_URL))]
+        ]
+        
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        
+        # Mark as notified
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE orders SET notified = true WHERE order_id = %s", (order.get('order_id'),))
         conn.commit()
         cur.close()
         conn.close()
         
-        await query.edit_message_text(
-            text=query.message.text + text,
-            parse_mode='HTML'
-        )
-            
+        logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
+        
     except Exception as e:
-        print(f"Callback xato: {e}")
+        logger.error(f"❌ Xabar yuborish xatosi: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    is_admin = user.id == ADMIN_CHAT_ID
     
-    # Admin uchun alohida tugmalar
-    if is_admin(user.id):
+    if is_admin:
         keyboard = [
             [InlineKeyboardButton("🍽️ Menyu", web_app=WebAppInfo(url=WEBAPP_URL))],
-            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=ADMIN_URL))],
-            [InlineKeyboardButton("📊 Statistika", callback_data="stats")]
+            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=ADMIN_URL))]
         ]
         await update.message.reply_text(
-            f"👋 Salom, Admin {user.first_name}!\n\n🍽️ BODRUM restorani boshqaruv paneli",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            f"👋 Salom, Admin <b>{user.first_name}</b>!\n\n"
+            f"🤖 Bot faol. Yangi buyurtmalar avtomatik keladi.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
         )
     else:
-        keyboard = [[InlineKeyboardButton("🍽️ Menyu", web_app=WebAppInfo(url=WEBAPP_URL))]]
+        keyboard = [[InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]]
         await update.message.reply_text(
-            f"👋 Salom, {user.first_name}!\n\n🍽️ BODRUM restorani",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
+            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
         )
 
-async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Statistikani ko'rsatish"""
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_admin(query.from_user.id):
-        await query.answer("❌ Ruxsat yo'q!", show_alert=True)
+    await query.answer()
+    
+    data = query.data
+    
+    if data.startswith(("accept_", "reject_")):
+        action, order_id = data.split("_", 1)
+        order = get_order(order_id)
+        
+        if not order:
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            return
+        
+        new_status = 'accepted' if action == 'accept' else 'rejected'
+        updated_order = update_order_status(order_id, new_status)
+        
+        if updated_order:
+            status_text = "✅ <b>QABUL QILINDI</b>" if action == 'accept' else "❌ <b>BEKOR QILINDI</b>"
+            
+            items = order.get('items', [])
+            if isinstance(items, str):
+                import json
+                items = json.loads(items)
+            
+            items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
+            
+            message = f"""{status_text}
+
+🆔 Buyurtma: #{order_id[-6:]}
+👤 Mijoz: {order.get('name')}
+📞 Telefon: +998 {order.get('phone')}
+💵 Summa: {format_price(order.get('total', 0))} so'm
+
+🍽 Mahsulotlar:
+{items_text}
+
+⏰ {datetime.now().strftime('%H:%M:%S')}"""
+            
+            await query.edit_message_text(message, parse_mode='HTML')
+            
+            # Mijozga xabar
+            tg_id = order.get('tg_id')
+            if tg_id:
+                try:
+                    if action == 'accept':
+                        msg = f"✅ Buyurtmangiz #{order_id[-6:]} qabul qilindi!\n\nTez orada yetkazib beramiz! 🚀"
+                    else:
+                        msg = f"❌ Buyurtmangiz #{order_id[-6:]} bekor qilindi.\n\nQo'llab-quvvatlash: +998901234567"
+                    
+                    await context.bot.send_message(chat_id=tg_id, text=msg)
+                except Exception as e:
+                    logger.error(f"Mijozga xabar yuborishda xato: {e}")
+        else:
+            await query.edit_message_text("❌ Xatolik yuz berdi!")
+
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test uchun - qo'lda tekshirish"""
+    user = update.effective_user
+    if user.id != ADMIN_CHAT_ID:
         return
     
-    await query.answer()
-    
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        
-        # Bugungi statistika
-        cur.execute("""
-            SELECT 
-                COUNT(*) as total_orders,
-                COALESCE(SUM(total), 0) as total_sum,
-                COUNT(CASE WHEN status = 'accepted' THEN 1 END) as accepted,
-                COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending
-            FROM orders 
-            WHERE DATE(created_at) = CURRENT_DATE
-        """)
-        
-        stats = cur.fetchone()
-        
-        # Oxirgi 7 kunlik statistika
-        cur.execute("""
-            SELECT 
-                DATE(created_at) as date,
-                COUNT(*) as count,
-                COALESCE(SUM(total), 0) as sum
-            FROM orders 
-            WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
-            AND payment_status = 'paid'
-            GROUP BY DATE(created_at)
-            ORDER BY date DESC
-        """)
-        
-        weekly = cur.fetchall()
-        
-        cur.close()
-        conn.close()
-        
-        weekly_text = "\n".join([
-            f"📅 {row[0].strftime('%d.%m')}: {row[1]} ta ({row[2]:,} so'm)"
-            for row in weekly[:5]
-        ])
-        
-        text = f"""📊 <b>Bugungi statistika:</b>
-
-📝 Jami buyurtmalar: {stats[0]}
-✅ Qabul qilingan: {stats[2]}
-⏳ Kutilmoqda: {stats[3]}
-💰 Jami summa: {stats[1]:,} so'm
-
-📈 Oxirgi 7 kun:
-{weekly_text}"""
-        
-        keyboard = [[InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_start")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-        
-    except Exception as e:
-        print(f"Statistika xato: {e}")
-
-async def back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Orqaga qaytish"""
-    query = update.callback_query
-    await query.answer()
-    
-    # Start funksiyasini chaqirish
-    await start(update, context)
+    await update.message.reply_text("🔍 Tekshirilmoqda...")
+    await check_new_orders(context)
+    await update.message.reply_text("✅ Tekshirish tugadi!")
 
 def main():
-    init_db()
-    
     application = Application.builder().token(TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(accept|reject)_"))
-    application.add_handler(CallbackQueryHandler(stats_handler, pattern="^stats$"))
-    application.add_handler(CallbackQueryHandler(back_handler, pattern="^back_to_start$"))
+    application.add_handler(CommandHandler("test", test_command))
+    application.add_handler(CallbackQueryHandler(callback_handler))
     
-    # Har 5 sekundda tekshirish
+    # Job Queue - Har 10 soniyada tekshirish
     job_queue = application.job_queue
-    job_queue.run_repeating(check_new_orders, interval=5, first=1)
+    job_queue.run_repeating(check_new_orders, interval=10, first=5)
     
-    print("🤖 Bot ishga tushdi...")
-    print(f"🌐 Web App URL: {WEBAPP_URL}")
-    print(f"👑 Admin URL: {ADMIN_URL}")
-    application.run_polling()
+    logger.info("🤖 Bot ishga tushdi! Polling: 10 sek")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
