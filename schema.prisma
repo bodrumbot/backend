@@ -1,0 +1,42 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Order {
+  id            String   @id @default(uuid())
+  orderId       String   @unique @map("order_id")
+  name          String   @map("name")
+  phone         String   @map("phone")
+  items         Json     @map("items")
+  total         Int      @map("total")
+  status        String   @default("payment_pending") @map("status")
+  paymentStatus String   @default("pending") @map("payment_status")
+  paymentMethod String   @default("payme") @map("payment_method")
+  location      String?  @map("location")
+  tgId          String?  @map("tg_id")
+  notified      Boolean  @default(false) @map("notified")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  
+  @@index([paymentStatus, status])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model MenuItem {
+  id          Int     @id @default(autoincrement())
+  name        String  @map("name")
+  price       Int     @map("price")
+  category    String  @map("category")
+  image       String? @map("image")
+  description String? @map("description")
+  available   Boolean @default(true) @map("available")
+  popular     Boolean @default(false) @map("popular")
+  
+  @@map("menu_items")
+}
