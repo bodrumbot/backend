@@ -1,13 +1,11 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import logging
 import asyncio
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
@@ -20,6 +18,7 @@ from telegram.ext import (
 )
 from aiohttp import web
 import aiohttp_cors
+import json
 
 load_dotenv()
 
@@ -36,36 +35,72 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 ADMIN_URL = f"{WEBAPP_URL}/admin.html"
 PORT = int(os.getenv("PORT", "8080"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # https://your-app.up.railway.app
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 # Global application
 application = None
+db_pool = None
 
-def get_db_connection():
+# ==========================================
+# DATABASE CONNECTION POOL
+# ==========================================
+
+def init_db_pool():
+    """Database connection pool yaratish"""
+    global db_pool
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL not set!")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    
+    try:
+        db_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=20,
+            dsn=DATABASE_URL
+        )
+        logger.info("✅ Database pool yaratildi")
+    except Exception as e:
+        logger.error(f"❌ Database pool xato: {e}")
+        raise
+
+def get_db_connection():
+    """Connection pool dan connection olish"""
+    global db_pool
+    if db_pool is None:
+        init_db_pool()
+    return db_pool.getconn()
+
+def release_db_connection(conn):
+    """Connection ni pool ga qaytarish"""
+    global db_pool
+    if db_pool and conn:
+        db_pool.putconn(conn)
 
 def format_price(price: int) -> str:
     return f"{price:,}".replace(",", " ")
 
 def get_order(order_id: str) -> Optional[Dict[str, Any]]:
+    """Bitta buyurtma olish"""
+    conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
         result = cur.fetchone()
         cur.close()
-        conn.close()
         return dict(result) if result else None
     except Exception as e:
         logger.error(f"Get order error: {e}")
         return None
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def update_order_status(order_id: str, status: str) -> Optional[Dict[str, Any]]:
+    """Buyurtma statusini yangilash"""
+    conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         update_data = {'status': status}
         if status == 'accepted':
@@ -85,30 +120,117 @@ def update_order_status(order_id: str, status: str) -> Optional[Dict[str, Any]]:
         result = cur.fetchone()
         conn.commit()
         cur.close()
-        conn.close()
         return dict(result) if result else None
     except Exception as e:
         logger.error(f"Update error: {e}")
+        if conn:
+            conn.rollback()
         return None
+    finally:
+        if conn:
+            release_db_connection(conn)
 
-last_notified_orders = set()
-last_check_time = None
-
-async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
-    global last_check_time
-    
+def create_order(data: Dict) -> Optional[Dict]:
+    """Yangi buyurtma yaratish"""
+    conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        if last_check_time:
+        # items ni JSON formatga o'tkazish
+        items = data.get('items', [])
+        if isinstance(items, list):
+            items_json = json.dumps(items)
+        else:
+            items_json = items
+        
+        cur.execute("""
+            INSERT INTO orders (
+                order_id, name, phone, items, total, 
+                status, payment_status, payment_method, 
+                location, tg_id, notified, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (
+            data.get('orderId'),
+            data.get('name'),
+            data.get('phone'),
+            items_json,
+            data.get('total'),
+            data.get('status', 'payment_pending'),
+            data.get('paymentStatus', 'pending'),
+            data.get('paymentMethod', 'payme'),
+            data.get('location'),
+            data.get('tgId'),
+            False,
+            datetime.utcnow()
+        ))
+        
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        
+        order_dict = dict(result)
+        # datetime larni string ga
+        for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
+            if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                order_dict[key] = order_dict[key].isoformat()
+        
+        return order_dict
+    except Exception as e:
+        logger.error(f"Create order error: {e}")
+        if conn:
+            conn.rollback()
+        return None
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+def get_all_orders() -> List[Dict]:
+    """Barcha buyurtmalarni olish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT * FROM orders 
+            ORDER BY created_at DESC 
+            LIMIT 100
+        """)
+        orders = cur.fetchall()
+        cur.close()
+        
+        result = []
+        for order in orders:
+            order_dict = dict(order)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            result.append(order_dict)
+        return result
+    except Exception as e:
+        logger.error(f"Get all orders error: {e}")
+        return []
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+def get_new_orders(since: str = None) -> List[Dict]:
+    """Yangi buyurtmalarni olish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        if since:
             cur.execute("""
                 SELECT * FROM orders 
                 WHERE payment_status = 'paid' 
                 AND status = 'payment_pending'
                 AND created_at > %s
                 ORDER BY created_at DESC
-            """, (last_check_time,))
+            """, (since,))
         else:
             cur.execute("""
                 SELECT * FROM orders 
@@ -119,7 +241,35 @@ async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
         
         orders = cur.fetchall()
         cur.close()
-        conn.close()
+        
+        result = []
+        for order in orders:
+            order_dict = dict(order)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            result.append(order_dict)
+        return result
+    except Exception as e:
+        logger.error(f"Get new orders error: {e}")
+        return []
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+# ==========================================
+# ORDER CHECKING
+# ==========================================
+
+last_notified_orders = set()
+last_check_time = None
+
+async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
+    """Har 10 soniyada yangi buyurtmalarni tekshirish"""
+    global last_check_time
+    
+    try:
+        orders = get_new_orders(last_check_time)
         
         if orders:
             logger.info(f"📊 Yangi buyurtmalar: {len(orders)} ta")
@@ -130,7 +280,7 @@ async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
                 if order_id in last_notified_orders:
                     continue
                 
-                await notify_admin(context, dict(order))
+                await notify_admin(context, order)
                 last_notified_orders.add(order_id)
         
         last_check_time = datetime.utcnow().isoformat()
@@ -139,13 +289,13 @@ async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Tekshirish xatosi: {e}")
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
+    """Admin ga yangi buyurtma haqida xabar yuborish"""
     try:
         items = order.get('items', [])
         if isinstance(items, str):
-            import json
             items = json.loads(items)
         
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
+        items_text = "\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
         
         message = f"""🛎️ <b>YANGI BUYURTMA!</b>
 
@@ -175,17 +325,28 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
             parse_mode='HTML'
         )
         
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE orders SET notified = true WHERE order_id = %s", (order.get('order_id'),))
-        conn.commit()
-        cur.close()
-        conn.close()
+        # Mark as notified
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("UPDATE orders SET notified = true WHERE order_id = %s", (order.get('order_id'),))
+            conn.commit()
+            cur.close()
+        except Exception as e:
+            logger.error(f"Mark notified error: {e}")
+        finally:
+            if conn:
+                release_db_connection(conn)
         
         logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
         
     except Exception as e:
         logger.error(f"❌ Xabar yuborish xatosi: {e}")
+
+# ==========================================
+# TELEGRAM HANDLERS
+# ==========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -197,7 +358,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=ADMIN_URL))]
         ]
         await update.message.reply_text(
-            f"👋 Salom, Admin <b>{user.first_name}</b>!\n\n"
+            f"👋 Salom, Admin <b>{user.first_name}</b>!\\n\\n"
             f"🤖 Bot faol. Yangi buyurtmalar avtomatik keladi.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
@@ -205,7 +366,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         keyboard = [[InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]]
         await update.message.reply_text(
-            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
+            f"👋 Salom, <b>{user.first_name}</b>!\\n\\n"
             f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
@@ -233,10 +394,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             items = order.get('items', [])
             if isinstance(items, str):
-                import json
                 items = json.loads(items)
             
-            items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
+            items_text = "\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
             
             message = f"""{status_text}
 
@@ -252,13 +412,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await query.edit_message_text(message, parse_mode='HTML')
             
+            # Mijozga xabar
             tg_id = order.get('tg_id')
             if tg_id:
                 try:
                     if action == 'accept':
-                        msg = f"✅ Buyurtmangiz #{order_id[-6:]} qabul qilindi!\n\nTez orada yetkazib beramiz! 🚀"
+                        msg = f"✅ Buyurtmangiz #{order_id[-6:]} qabul qilindi!\\n\\nTez orada yetkazib beramiz! 🚀"
                     else:
-                        msg = f"❌ Buyurtmangiz #{order_id[-6:]} bekor qilindi.\n\nQo'llab-quvvatlash: +998901234567"
+                        msg = f"❌ Buyurtmangiz #{order_id[-6:]} bekor qilindi.\\n\\nQo'llab-quvvatlash: +998901234567"
                     
                     await context.bot.send_message(chat_id=tg_id, text=msg)
                 except Exception as e:
@@ -267,6 +428,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Xatolik yuz berdi!")
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test uchun - qo'lda tekshirish"""
     user = update.effective_user
     if user.id != ADMIN_CHAT_ID:
         return
@@ -275,142 +437,188 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await check_new_orders(context)
     await update.message.reply_text("✅ Tekshirish tugadi!")
 
-# ========== AIOHTTP WEB SERVER ==========
+# ==========================================
+# HTTP API HANDLERS
+# ==========================================
 
 async def health_handler(request):
-    return web.json_response({"status": "ok", "service": "bodrum-bot"})
+    return web.json_response({
+        "status": "ok", 
+        "service": "bodrum-bot",
+        "mode": "webhook",
+        "database": "connected" if db_pool else "disconnected"
+    })
 
 async def get_orders_handler(request):
+    """Barcha buyurtmalarni olish"""
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 100")
-        orders = cur.fetchall()
-        cur.close()
-        conn.close()
-        return web.json_response([dict(o) for o in orders])
+        orders = get_all_orders()
+        return web.json_response(orders)
     except Exception as e:
         logger.error(f"API get orders error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
+async def get_new_orders_handler(request):
+    """Yangi buyurtmalarni olish (polling uchun)"""
+    try:
+        orders = get_new_orders()
+        return web.json_response(orders)
+    except Exception as e:
+        logger.error(f"API get new orders error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
 async def create_order_handler(request):
+    """Yangi buyurtma yaratish"""
     try:
         data = await request.json()
-        conn = get_db_connection()
-        cur = conn.cursor()
+        logger.info(f"📝 Yangi buyurtma: {data.get('orderId')}")
         
-        cur.execute("""
-            INSERT INTO orders (order_id, name, phone, items, total, status, payment_status, payment_method, location, tg_id, notified, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING *
-        """, (
-            data.get('orderId'),
-            data.get('name'),
-            data.get('phone'),
-            psycopg2.extras.Json(data.get('items')),
-            data.get('total'),
-            data.get('status', 'payment_pending'),
-            data.get('paymentStatus', 'pending'),
-            data.get('paymentMethod', 'payme'),
-            data.get('location'),
-            data.get('tgId'),
-            False,
-            datetime.utcnow()
-        ))
+        order = create_order(data)
         
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        return web.json_response(dict(result), status=201)
+        if order:
+            logger.info(f"✅ Buyurtma yaratildi: {order['order_id']}")
+            return web.json_response(order, status=201)
+        else:
+            return web.json_response({"error": "Failed to create order"}, status=500)
         
     except Exception as e:
         logger.error(f"API create order error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
 async def get_order_handler(request):
+    """Bitta buyurtma ma'lumotlari"""
     try:
         order_id = request.match_info['order_id']
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
-        order = cur.fetchone()
-        cur.close()
-        conn.close()
+        order = get_order(order_id)
         
         if not order:
             return web.json_response({"error": "Not found"}, status=404)
-        return web.json_response(dict(order))
         
+        return web.json_response(order)
     except Exception as e:
         logger.error(f"API get order error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
 async def update_order_handler(request):
+    """Buyurtma statusini yangilash"""
     try:
         order_id = request.match_info['order_id']
         data = await request.json()
         
-        conn = get_db_connection()
-        cur = conn.cursor()
+        logger.info(f"📝 Buyurtma yangilanmoqda: {order_id} - {data}")
         
-        updates = []
-        values = []
-        
-        if 'status' in data:
-            updates.append("status = %s")
-            values.append(data['status'])
-        if 'paymentStatus' in data:
-            updates.append("payment_status = %s")
-            values.append(data['paymentStatus'])
-        if 'acceptedAt' in data:
-            updates.append("accepted_at = %s")
-            values.append(data['acceptedAt'])
-        if 'rejectedAt' in data:
-            updates.append("rejected_at = %s")
-            values.append(data['rejectedAt'])
-        
-        if not updates:
-            return web.json_response({"error": "No updates"}, status=400)
-        
-        values.append(order_id)
-        query = f"UPDATE orders SET {', '.join(updates)} WHERE order_id = %s RETURNING *"
-        
-        cur.execute(query, values)
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        return web.json_response(dict(result))
-        
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            updates = []
+            values = []
+            
+            if 'status' in data:
+                updates.append("status = %s")
+                values.append(data['status'])
+            if 'paymentStatus' in data:
+                updates.append("payment_status = %s")
+                values.append(data['paymentStatus'])
+            if 'payment_method' in data:
+                updates.append("payment_method = %s")
+                values.append(data['payment_method'])
+            if 'acceptedAt' in data:
+                updates.append("accepted_at = %s")
+                values.append(data['acceptedAt'])
+            if 'rejectedAt' in data:
+                updates.append("rejected_at = %s")
+                values.append(data['rejectedAt'])
+            if 'paidAt' in data:
+                updates.append("paid_at = %s")
+                values.append(data['paidAt'])
+            
+            if not updates:
+                return web.json_response({"error": "No updates"}, status=400)
+            
+            values.append(order_id)
+            query = f"UPDATE orders SET {', '.join(updates)} WHERE order_id = %s RETURNING *"
+            
+            cur.execute(query, values)
+            result = cur.fetchone()
+            conn.commit()
+            cur.close()
+            
+            if not result:
+                return web.json_response({"error": "Order not found"}, status=404)
+            
+            order_dict = dict(result)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            
+            logger.info(f"✅ Buyurtma yangilandi: {order_id}")
+            return web.json_response(order_dict)
+            
+        except Exception as e:
+            logger.error(f"Update handler error: {e}")
+            if conn:
+                conn.rollback()
+            return web.json_response({"error": str(e)}, status=500)
+        finally:
+            if conn:
+                release_db_connection(conn)
+                
     except Exception as e:
         logger.error(f"API update order error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
 async def webhook_handler(request):
+    """Telegram webhook"""
     global application
     
     if application:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
+        try:
+            data = await request.json()
+            update = Update.de_json(data, application.bot)
+            await application.process_update(update)
+        except Exception as e:
+            logger.error(f"Webhook processing error: {e}")
     
     return web.Response(text='OK')
 
+# ==========================================
+# WEBHOOK INIT
+# ==========================================
+
 async def init_webhook(app):
-    global application
+    global application, db_pool
     
-    # Delete webhook and pending updates
+    # Database pool ni ishga tushirish
+    try:
+        init_db_pool()
+    except Exception as e:
+        logger.error(f"❌ Database init error: {e}")
+        raise
+    
+    # WEBHOOK_URL tekshirish
+    if not WEBHOOK_URL:
+        logger.error("❌ WEBHOOK_URL o'rnatilmagan!")
+        raise ValueError("WEBHOOK_URL not set")
+    
+    webhook_url = WEBHOOK_URL.rstrip('/')
+    if not webhook_url.startswith('https://'):
+        webhook_url = 'https://' + webhook_url
+    
+    full_webhook_url = f"{webhook_url}/webhook"
+    
+    logger.info(f"🔧 Webhook URL: {full_webhook_url}")
+    
+    # Eski webhook ni o'chirish
     temp_app = Application.builder().token(TOKEN).build()
     await temp_app.bot.delete_webhook(drop_pending_updates=True)
     await temp_app.shutdown()
     
-    # Create main application
+    # Yangi application
     application = Application.builder().token(TOKEN).build()
     
-    # Add handlers
+    # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
@@ -419,56 +627,94 @@ async def init_webhook(app):
     job_queue = application.job_queue
     job_queue.run_repeating(check_new_orders, interval=10, first=5)
     
-    # Initialize and start
+    # Start
     await application.initialize()
     await application.start()
     
-    # Set webhook
-    webhook_url = f"{WEBHOOK_URL}/webhook"
-    await application.bot.set_webhook(webhook_url)
+    # Webhook o'rnatish
+    try:
+        await application.bot.set_webhook(full_webhook_url)
+        logger.info(f"✅ Webhook o'rnatildi: {full_webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ Webhook xato: {e}")
+        raise
     
-    logger.info(f"🤖 Bot webhook mode da ishga tushdi!")
-    logger.info(f"📍 Webhook URL: {webhook_url}")
+    logger.info("🤖 Bot webhook mode da ishga tushdi!")
 
 async def shutdown(app):
-    global application
+    global application, db_pool
+    
     if application:
         await application.stop()
         await application.shutdown()
         logger.info("🛑 Bot to'xtatildi")
+    
+    if db_pool:
+        db_pool.closeall()
+        logger.info("🛑 Database pool yopildi")
+
+# ==========================================
+# MAIN
+# ==========================================
 
 def main():
-    # Aiohttp app
-    app = web.Application()
+    global application
     
-    # CORS
-    cors = aiohttp_cors.setup(app, defaults={
-        "*": aiohttp_cors.ResourceOptions(
-            allow_credentials=True,
-            expose_headers="*",
-            allow_headers="*",
-            allow_methods="*"
-        )
-    })
+    use_webhook = bool(WEBHOOK_URL and WEBHOOK_URL.strip())
     
-    # Routes
-    app.router.add_get('/', health_handler)
-    app.router.add_get('/api/orders', get_orders_handler)
-    app.router.add_post('/api/orders', create_order_handler)
-    app.router.add_get('/api/orders/{order_id}', get_order_handler)
-    app.router.add_put('/api/orders/{order_id}', update_order_handler)
-    app.router.add_post('/webhook', webhook_handler)
-    
-    # CORS for all routes
-    for route in list(app.router.routes()):
-        cors.add(route)
-    
-    # Startup and cleanup
-    app.on_startup.append(init_webhook)
-    app.on_cleanup.append(shutdown)
-    
-    # Run
-    web.run_app(app, host='0.0.0.0', port=PORT)
+    if use_webhook:
+        logger.info("🔧 Webhook + HTTP API mode")
+        
+        app = web.Application()
+        
+        # CORS
+        cors = aiohttp_cors.setup(app, defaults={
+            "*": aiohttp_cors.ResourceOptions(
+                allow_credentials=True,
+                expose_headers="*",
+                allow_headers="*",
+                allow_methods="*"
+            )
+        })
+        
+        # Routes
+        app.router.add_get('/', health_handler)
+        app.router.add_get('/api/orders', get_orders_handler)
+        app.router.add_get('/api/orders/new', get_new_orders_handler)
+        app.router.add_post('/api/orders', create_order_handler)
+        app.router.add_get('/api/orders/{order_id}', get_order_handler)
+        app.router.add_put('/api/orders/{order_id}', update_order_handler)
+        app.router.add_post('/webhook', webhook_handler)
+        
+        # CORS
+        for route in list(app.router.routes()):
+            cors.add(route)
+        
+        # Lifecycle
+        app.on_startup.append(init_webhook)
+        app.on_cleanup.append(shutdown)
+        
+        # Run
+        web.run_app(app, host='0.0.0.0', port=PORT)
+        
+    else:
+        # Polling mode (fallback)
+        logger.info("🔧 Polling mode")
+        
+        # Database pool
+        init_db_pool()
+        
+        application = Application.builder().token(TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("test", test_command))
+        application.add_handler(CallbackQueryHandler(callback_handler))
+        
+        job_queue = application.job_queue
+        job_queue.run_repeating(check_new_orders, interval=10, first=5)
+        
+        logger.info("🤖 Bot polling mode da!")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
