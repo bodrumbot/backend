@@ -3,7 +3,6 @@ import logging
 import asyncio
 import psycopg2
 import psycopg2.extras
-import psycopg2.pool
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
@@ -28,8 +27,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Environment variables - DATABASE_PUBLIC_URL ishlatish!
+DATABASE_URL = os.getenv("DATABASE_PUBLIC_URL") or os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
@@ -39,41 +38,16 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 # Global application
 application = None
-db_pool = None
 
 # ==========================================
-# DATABASE CONNECTION POOL
+# DATABASE FUNCTIONS (Simple, no pool)
 # ==========================================
-
-def init_db_pool():
-    """Database connection pool yaratish"""
-    global db_pool
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL not set!")
-    
-    try:
-        db_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=1,
-            maxconn=20,
-            dsn=DATABASE_URL
-        )
-        logger.info("✅ Database pool yaratildi")
-    except Exception as e:
-        logger.error(f"❌ Database pool xato: {e}")
-        raise
 
 def get_db_connection():
-    """Connection pool dan connection olish"""
-    global db_pool
-    if db_pool is None:
-        init_db_pool()
-    return db_pool.getconn()
-
-def release_db_connection(conn):
-    """Connection ni pool ga qaytarish"""
-    global db_pool
-    if db_pool and conn:
-        db_pool.putconn(conn)
+    """Simple connection - har bir so'rovda yangi connection"""
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL not set!")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def format_price(price: int) -> str:
     return f"{price:,}".replace(",", " ")
@@ -83,59 +57,32 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur = conn.cursor()
         cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
         result = cur.fetchone()
         cur.close()
-        return dict(result) if result else None
+        
+        if result:
+            order_dict = dict(result)
+            # datetime larni string ga
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            return order_dict
+        return None
     except Exception as e:
         logger.error(f"Get order error: {e}")
         return None
     finally:
         if conn:
-            release_db_connection(conn)
-
-def update_order_status(order_id: str, status: str) -> Optional[Dict[str, Any]]:
-    """Buyurtma statusini yangilash"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        update_data = {'status': status}
-        if status == 'accepted':
-            update_data['accepted_at'] = datetime.utcnow().isoformat()
-        elif status == 'rejected':
-            update_data['rejected_at'] = datetime.utcnow().isoformat()
-        
-        fields = []
-        values = []
-        for key, val in update_data.items():
-            fields.append(f"{key} = %s")
-            values.append(val)
-        values.append(order_id)
-        
-        query = f"UPDATE orders SET {', '.join(fields)} WHERE order_id = %s RETURNING *"
-        cur.execute(query, values)
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        return dict(result) if result else None
-    except Exception as e:
-        logger.error(f"Update error: {e}")
-        if conn:
-            conn.rollback()
-        return None
-    finally:
-        if conn:
-            release_db_connection(conn)
+            conn.close()
 
 def create_order(data: Dict) -> Optional[Dict]:
     """Yangi buyurtma yaratish"""
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur = conn.cursor()
         
         # items ni JSON formatga o'tkazish
         items = data.get('items', [])
@@ -171,13 +118,15 @@ def create_order(data: Dict) -> Optional[Dict]:
         conn.commit()
         cur.close()
         
-        order_dict = dict(result)
-        # datetime larni string ga
-        for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
-            if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                order_dict[key] = order_dict[key].isoformat()
+        if result:
+            order_dict = dict(result)
+            # datetime larni string ga
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            return order_dict
+        return None
         
-        return order_dict
     except Exception as e:
         logger.error(f"Create order error: {e}")
         if conn:
@@ -185,14 +134,14 @@ def create_order(data: Dict) -> Optional[Dict]:
         return None
     finally:
         if conn:
-            release_db_connection(conn)
+            conn.close()
 
 def get_all_orders() -> List[Dict]:
     """Barcha buyurtmalarni olish"""
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur = conn.cursor()
         cur.execute("""
             SELECT * FROM orders 
             ORDER BY created_at DESC 
@@ -214,14 +163,62 @@ def get_all_orders() -> List[Dict]:
         return []
     finally:
         if conn:
-            release_db_connection(conn)
+            conn.close()
+
+def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[str, Any]]:
+    """Buyurtma statusini yangilash"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        update_data = {'status': status}
+        if status == 'accepted':
+            update_data['accepted_at'] = datetime.utcnow().isoformat()
+        elif status == 'rejected':
+            update_data['rejected_at'] = datetime.utcnow().isoformat()
+        
+        # Qo'shimcha yangilanishlar
+        for key, val in kwargs.items():
+            if val is not None:
+                update_data[key] = val
+        
+        fields = []
+        values = []
+        for key, val in update_data.items():
+            fields.append(f"{key} = %s")
+            values.append(val)
+        values.append(order_id)
+        
+        query = f"UPDATE orders SET {', '.join(fields)} WHERE order_id = %s RETURNING *"
+        cur.execute(query, values)
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        
+        if result:
+            order_dict = dict(result)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            return order_dict
+        return None
+        
+    except Exception as e:
+        logger.error(f"Update error: {e}")
+        if conn:
+            conn.rollback()
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 def get_new_orders(since: str = None) -> List[Dict]:
     """Yangi buyurtmalarni olish"""
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur = conn.cursor()
         
         if since:
             cur.execute("""
@@ -255,7 +252,7 @@ def get_new_orders(since: str = None) -> List[Dict]:
         return []
     finally:
         if conn:
-            release_db_connection(conn)
+            conn.close()
 
 # ==========================================
 # ORDER CHECKING
@@ -337,7 +334,7 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
             logger.error(f"Mark notified error: {e}")
         finally:
             if conn:
-                release_db_connection(conn)
+                conn.close()
         
         logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
         
@@ -446,7 +443,7 @@ async def health_handler(request):
         "status": "ok", 
         "service": "bodrum-bot",
         "mode": "webhook",
-        "database": "connected" if db_pool else "disconnected"
+        "database_url_set": bool(DATABASE_URL)
     })
 
 async def get_orders_handler(request):
@@ -510,7 +507,7 @@ async def update_order_handler(request):
         conn = None
         try:
             conn = get_db_connection()
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur = conn.cursor()
             
             updates = []
             values = []
@@ -563,7 +560,7 @@ async def update_order_handler(request):
             return web.json_response({"error": str(e)}, status=500)
         finally:
             if conn:
-                release_db_connection(conn)
+                conn.close()
                 
     except Exception as e:
         logger.error(f"API update order error: {e}")
@@ -588,14 +585,7 @@ async def webhook_handler(request):
 # ==========================================
 
 async def init_webhook(app):
-    global application, db_pool
-    
-    # Database pool ni ishga tushirish
-    try:
-        init_db_pool()
-    except Exception as e:
-        logger.error(f"❌ Database init error: {e}")
-        raise
+    global application
     
     # WEBHOOK_URL tekshirish
     if not WEBHOOK_URL:
@@ -609,6 +599,7 @@ async def init_webhook(app):
     full_webhook_url = f"{webhook_url}/webhook"
     
     logger.info(f"🔧 Webhook URL: {full_webhook_url}")
+    logger.info(f"🔧 Database URL set: {bool(DATABASE_URL)}")
     
     # Eski webhook ni o'chirish
     temp_app = Application.builder().token(TOKEN).build()
@@ -642,16 +633,11 @@ async def init_webhook(app):
     logger.info("🤖 Bot webhook mode da ishga tushdi!")
 
 async def shutdown(app):
-    global application, db_pool
-    
+    global application
     if application:
         await application.stop()
         await application.shutdown()
         logger.info("🛑 Bot to'xtatildi")
-    
-    if db_pool:
-        db_pool.closeall()
-        logger.info("🛑 Database pool yopildi")
 
 # ==========================================
 # MAIN
@@ -700,9 +686,6 @@ def main():
     else:
         # Polling mode (fallback)
         logger.info("🔧 Polling mode")
-        
-        # Database pool
-        init_db_pool()
         
         application = Application.builder().token(TOKEN).build()
         
