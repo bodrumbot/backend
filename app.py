@@ -18,6 +18,8 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+from aiohttp import web
+import aiohttp_cors
 
 load_dotenv()
 
@@ -27,15 +29,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Railway PostgreSQL
+# Environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 ADMIN_URL = f"{WEBAPP_URL}/admin.html"
+PORT = int(os.getenv("PORT", "8080"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # https://your-app.up.railway.app
 
-# Database connection
+# Global application
+application = None
+
 def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL not set!")
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def format_price(price: int) -> str:
@@ -65,7 +73,6 @@ def update_order_status(order_id: str, status: str) -> Optional[Dict[str, Any]]:
         elif status == 'rejected':
             update_data['rejected_at'] = datetime.utcnow().isoformat()
         
-        # Build query dynamically
         fields = []
         values = []
         for key, val in update_data.items():
@@ -84,19 +91,16 @@ def update_order_status(order_id: str, status: str) -> Optional[Dict[str, Any]]:
         logger.error(f"Update error: {e}")
         return None
 
-# Polling for new orders
 last_notified_orders = set()
 last_check_time = None
 
 async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
-    """Har 10 soniyada yangi buyurtmalarni tekshirish"""
     global last_check_time
     
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Query for paid + payment_pending orders
         if last_check_time:
             cur.execute("""
                 SELECT * FROM orders 
@@ -135,7 +139,6 @@ async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Tekshirish xatosi: {e}")
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
-    """Admin ga yangi buyurtma haqida xabar yuborish"""
     try:
         items = order.get('items', [])
         if isinstance(items, str):
@@ -172,7 +175,6 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
             parse_mode='HTML'
         )
         
-        # Mark as notified
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("UPDATE orders SET notified = true WHERE order_id = %s", (order.get('order_id'),))
@@ -250,7 +252,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await query.edit_message_text(message, parse_mode='HTML')
             
-            # Mijozga xabar
             tg_id = order.get('tg_id')
             if tg_id:
                 try:
@@ -266,7 +267,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Xatolik yuz berdi!")
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test uchun - qo'lda tekshirish"""
     user = update.effective_user
     if user.id != ADMIN_CHAT_ID:
         return
@@ -275,19 +275,200 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await check_new_orders(context)
     await update.message.reply_text("✅ Tekshirish tugadi!")
 
-def main():
+# ========== AIOHTTP WEB SERVER ==========
+
+async def health_handler(request):
+    return web.json_response({"status": "ok", "service": "bodrum-bot"})
+
+async def get_orders_handler(request):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 100")
+        orders = cur.fetchall()
+        cur.close()
+        conn.close()
+        return web.json_response([dict(o) for o in orders])
+    except Exception as e:
+        logger.error(f"API get orders error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+async def create_order_handler(request):
+    try:
+        data = await request.json()
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            INSERT INTO orders (order_id, name, phone, items, total, status, payment_status, payment_method, location, tg_id, notified, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (
+            data.get('orderId'),
+            data.get('name'),
+            data.get('phone'),
+            psycopg2.extras.Json(data.get('items')),
+            data.get('total'),
+            data.get('status', 'payment_pending'),
+            data.get('paymentStatus', 'pending'),
+            data.get('paymentMethod', 'payme'),
+            data.get('location'),
+            data.get('tgId'),
+            False,
+            datetime.utcnow()
+        ))
+        
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return web.json_response(dict(result), status=201)
+        
+    except Exception as e:
+        logger.error(f"API create order error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+async def get_order_handler(request):
+    try:
+        order_id = request.match_info['order_id']
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+        order = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not order:
+            return web.json_response({"error": "Not found"}, status=404)
+        return web.json_response(dict(order))
+        
+    except Exception as e:
+        logger.error(f"API get order error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+async def update_order_handler(request):
+    try:
+        order_id = request.match_info['order_id']
+        data = await request.json()
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        updates = []
+        values = []
+        
+        if 'status' in data:
+            updates.append("status = %s")
+            values.append(data['status'])
+        if 'paymentStatus' in data:
+            updates.append("payment_status = %s")
+            values.append(data['paymentStatus'])
+        if 'acceptedAt' in data:
+            updates.append("accepted_at = %s")
+            values.append(data['acceptedAt'])
+        if 'rejectedAt' in data:
+            updates.append("rejected_at = %s")
+            values.append(data['rejectedAt'])
+        
+        if not updates:
+            return web.json_response({"error": "No updates"}, status=400)
+        
+        values.append(order_id)
+        query = f"UPDATE orders SET {', '.join(updates)} WHERE order_id = %s RETURNING *"
+        
+        cur.execute(query, values)
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return web.json_response(dict(result))
+        
+    except Exception as e:
+        logger.error(f"API update order error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+async def webhook_handler(request):
+    global application
+    
+    if application:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+    
+    return web.Response(text='OK')
+
+async def init_webhook(app):
+    global application
+    
+    # Delete webhook and pending updates
+    temp_app = Application.builder().token(TOKEN).build()
+    await temp_app.bot.delete_webhook(drop_pending_updates=True)
+    await temp_app.shutdown()
+    
+    # Create main application
     application = Application.builder().token(TOKEN).build()
     
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     
-    # Job Queue - Har 10 soniyada tekshirish
+    # Job queue
     job_queue = application.job_queue
     job_queue.run_repeating(check_new_orders, interval=10, first=5)
     
-    logger.info("🤖 Bot ishga tushdi! Polling: 10 sek")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Initialize and start
+    await application.initialize()
+    await application.start()
+    
+    # Set webhook
+    webhook_url = f"{WEBHOOK_URL}/webhook"
+    await application.bot.set_webhook(webhook_url)
+    
+    logger.info(f"🤖 Bot webhook mode da ishga tushdi!")
+    logger.info(f"📍 Webhook URL: {webhook_url}")
+
+async def shutdown(app):
+    global application
+    if application:
+        await application.stop()
+        await application.shutdown()
+        logger.info("🛑 Bot to'xtatildi")
+
+def main():
+    # Aiohttp app
+    app = web.Application()
+    
+    # CORS
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*"
+        )
+    })
+    
+    # Routes
+    app.router.add_get('/', health_handler)
+    app.router.add_get('/api/orders', get_orders_handler)
+    app.router.add_post('/api/orders', create_order_handler)
+    app.router.add_get('/api/orders/{order_id}', get_order_handler)
+    app.router.add_put('/api/orders/{order_id}', update_order_handler)
+    app.router.add_post('/webhook', webhook_handler)
+    
+    # CORS for all routes
+    for route in list(app.router.routes()):
+        cors.add(route)
+    
+    # Startup and cleanup
+    app.on_startup.append(init_webhook)
+    app.on_cleanup.append(shutdown)
+    
+    # Run
+    web.run_app(app, host='0.0.0.0', port=PORT)
 
 if __name__ == "__main__":
     main()
