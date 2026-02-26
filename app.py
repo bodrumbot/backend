@@ -31,10 +31,8 @@ logger = logging.getLogger(__name__)
 # ENVIRONMENT VARIABLES - RAILWAY UCHUN
 # ==========================================
 
-# Railway avtomatik PORT beradi - 8080 default emas!
 PORT = int(os.getenv("PORT", "3000"))
 
-# Database URL - bir nechta variantni tekshirish
 DATABASE_URL = (os.getenv("DATABASE_PUBLIC_URL") or 
                 os.getenv("DATABASE_URL") or 
                 os.getenv("DATABASE_PRIVATE_URL") or
@@ -44,11 +42,9 @@ TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 
-# Railway domain avtomatik aniqlash
 RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL", "")
 
-# WEBHOOK_URL ni aniqlash
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 if not WEBHOOK_URL and RAILWAY_PUBLIC_DOMAIN:
     WEBHOOK_URL = f"https://{RAILWAY_PUBLIC_DOMAIN}"
@@ -63,7 +59,6 @@ logger.info(f"   DATABASE_URL set: {bool(DATABASE_URL)}")
 logger.info(f"   TOKEN set: {bool(TOKEN)}")
 logger.info(f"   ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
 
-# Global application
 application = None
 
 # ==========================================
@@ -71,7 +66,7 @@ application = None
 # ==========================================
 
 def get_db_connection():
-    """Simple connection - har bir so'rovda yangi connection"""
+    """Database connection"""
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL not set!")
     try:
@@ -83,6 +78,26 @@ def get_db_connection():
 
 def format_price(price: int) -> str:
     return f"{price:,}".replace(",", " ")
+
+def check_column_exists(table_name, column_name):
+    """Check if column exists in table"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM information_schema.columns 
+            WHERE table_name = %s AND column_name = %s
+        """, (table_name, column_name))
+        result = cur.fetchone()
+        cur.close()
+        return result is not None
+    except Exception as e:
+        logger.error(f"Check column error: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     """Bitta buyurtma olish"""
@@ -96,7 +111,6 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
         
         if result:
             order_dict = dict(result)
-            # datetime larni string ga
             for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
@@ -110,7 +124,7 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
             conn.close()
 
 def create_order(data: Dict) -> Optional[Dict]:
-    """Yangi buyurtma yaratish - skrinshot bilan"""
+    """Yangi buyurtma yaratish - skrinshot bilan (fallback)"""
     conn = None
     try:
         conn = get_db_connection()
@@ -122,35 +136,67 @@ def create_order(data: Dict) -> Optional[Dict]:
         else:
             items_json = items
         
-        # ⭐ Skrinshot ni saqlash
         screenshot = data.get('screenshot')
         screenshot_name = data.get('screenshotName', '')
         
-        cur.execute("""
-            INSERT INTO orders (
-                order_id, name, phone, items, total, 
-                status, payment_status, payment_method, 
-                location, tg_id, notified, created_at,
-                screenshot, screenshot_name
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING *
-        """, (
-            data.get('orderId'),
-            data.get('name'),
-            data.get('phone'),
-            items_json,
-            data.get('total'),
-            data.get('status', 'pending_verification'),
-            data.get('paymentStatus', 'pending_verification'),
-            data.get('paymentMethod', 'payme'),
-            data.get('location'),
-            data.get('tgId'),
-            False,
-            datetime.utcnow(),
-            screenshot,
-            screenshot_name
-        ))
+        # Check if screenshot columns exist
+        has_screenshot_col = check_column_exists('orders', 'screenshot')
+        has_screenshot_name_col = check_column_exists('orders', 'screenshot_name')
+        
+        logger.info(f"📊 Database columns: screenshot={has_screenshot_col}, screenshot_name={has_screenshot_name_col}")
+        
+        if has_screenshot_col and has_screenshot_name_col:
+            # Full insert with screenshot
+            cur.execute("""
+                INSERT INTO orders (
+                    order_id, name, phone, items, total, 
+                    status, payment_status, payment_method, 
+                    location, tg_id, notified, created_at,
+                    screenshot, screenshot_name
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """, (
+                data.get('orderId'),
+                data.get('name'),
+                data.get('phone'),
+                items_json,
+                data.get('total'),
+                data.get('status', 'pending_verification'),
+                data.get('paymentStatus', 'pending_verification'),
+                data.get('paymentMethod', 'payme'),
+                data.get('location'),
+                data.get('tgId'),
+                False,
+                datetime.utcnow(),
+                screenshot,
+                screenshot_name
+            ))
+        else:
+            # Fallback: insert without screenshot columns
+            logger.warning("⚠️ Screenshot columns not found, using fallback insert")
+            cur.execute("""
+                INSERT INTO orders (
+                    order_id, name, phone, items, total, 
+                    status, payment_status, payment_method, 
+                    location, tg_id, notified, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """, (
+                data.get('orderId'),
+                data.get('name'),
+                data.get('phone'),
+                items_json,
+                data.get('total'),
+                data.get('status', 'pending_verification'),
+                data.get('paymentStatus', 'pending_verification'),
+                data.get('paymentMethod', 'payme'),
+                data.get('location'),
+                data.get('tgId'),
+                False,
+                datetime.utcnow()
+            ))
         
         result = cur.fetchone()
         conn.commit()
@@ -215,7 +261,6 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         elif status == 'rejected':
             update_data['rejected_at'] = datetime.utcnow().isoformat()
         
-        # Qo'shimcha yangilanishlar
         for key, val in kwargs.items():
             if val is not None:
                 update_data[key] = val
@@ -260,16 +305,14 @@ def get_new_orders(since: str = None) -> List[Dict]:
         if since:
             cur.execute("""
                 SELECT * FROM orders 
-                WHERE payment_status = 'paid' 
-                AND status = 'payment_pending'
+                WHERE status IN ('pending_verification', 'payment_pending')
                 AND created_at > %s
                 ORDER BY created_at DESC
             """, (since,))
         else:
             cur.execute("""
                 SELECT * FROM orders 
-                WHERE payment_status = 'paid' 
-                AND status = 'payment_pending'
+                WHERE status IN ('pending_verification', 'payment_pending')
                 ORDER BY created_at DESC
             """)
         
@@ -314,8 +357,9 @@ async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
                 if order_id in last_notified_orders:
                     continue
                 
-                await notify_admin(context, order)
-                last_notified_orders.add(order_id)
+                if not order.get('notified'):
+                    await notify_admin(context, order)
+                    last_notified_orders.add(order_id)
         
         last_check_time = datetime.utcnow().isoformat()
         
@@ -331,7 +375,11 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
         
         items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
         
-        message = f"""🛎️ <b>YANGI BUYURTMA!</b>
+        # Screenshot borligini tekshirish
+        has_screenshot = order.get('screenshot') or order.get('screenshot_name')
+        screenshot_indicator = " 📸" if has_screenshot else ""
+        
+        message = f"""🛎️ <b>YANGI BUYURTMA!{screenshot_indicator}</b>
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 👤 Mijoz: {order.get('name')}
@@ -432,6 +480,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
             
+            # Screenshot borligini ko'rsatish
+            has_screenshot = order.get('screenshot') or order.get('screenshot_name')
+            screenshot_info = "\n\n📸 Skrinshot: Mavjud" if has_screenshot else ""
+            
             message = f"""{status_text}
 
 🆔 Buyurtma: #{order_id[-6:]}
@@ -440,7 +492,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💵 Summa: {format_price(order.get('total', 0))} so'm
 
 🍽 Mahsulotlar:
-{items_text}
+{items_text}{screenshot_info}
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}"""
             
@@ -476,7 +528,7 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 
 async def health_handler(request):
-    """Health check - Railway uchun muhim!"""
+    """Health check"""
     return web.json_response({
         "status": "ok", 
         "service": "bodrum-bot",
@@ -620,20 +672,18 @@ async def webhook_handler(request):
     return web.Response(text='OK')
 
 # ==========================================
-# WEBHOOK INIT - RAILWAY UCHUN
+# WEBHOOK INIT
 # ==========================================
 
 async def init_webhook(app):
     global application
     
-    # Railway health check uchun server ishga tushsin
     if not TOKEN:
         logger.error("❌ TOKEN o'rnatilmagan!")
         return
     
     if not WEBHOOK_URL:
         logger.warning("⚠️ WEBHOOK_URL o'rnatilmagan! Polling mode ishlatiladi.")
-        # Webhook yo'q bo'lsa, polling mode
         application = Application.builder().token(TOKEN).build()
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("test", test_command))
@@ -655,7 +705,6 @@ async def init_webhook(app):
     
     logger.info(f"🔧 Webhook URL: {full_webhook_url}")
     
-    # Eski webhook ni o'chirish
     try:
         temp_app = Application.builder().token(TOKEN).build()
         await temp_app.bot.delete_webhook(drop_pending_updates=True)
@@ -664,29 +713,23 @@ async def init_webhook(app):
     except Exception as e:
         logger.warning(f"⚠️ Eski webhook o'chirishda xato: {e}")
     
-    # Yangi application
     application = Application.builder().token(TOKEN).build()
     
-    # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     
-    # Job queue
     job_queue = application.job_queue
     job_queue.run_repeating(check_new_orders, interval=10, first=5)
     
-    # Start
     await application.initialize()
     await application.start()
     
-    # Webhook o'rnatish
     try:
         await application.bot.set_webhook(full_webhook_url)
         logger.info(f"✅ Webhook o'rnatildi: {full_webhook_url}")
     except Exception as e:
         logger.error(f"❌ Webhook xato: {e}")
-        # Webhook xato bersa ham server ishlayveradi
     
     logger.info("🤖 Bot webhook mode da ishga tushdi!")
 
@@ -701,7 +744,7 @@ async def shutdown(app):
             logger.error(f"Shutdown xato: {e}")
 
 # ==========================================
-# MAIN - RAILWAY UCHUN
+# MAIN
 # ==========================================
 
 def main():
@@ -709,14 +752,12 @@ def main():
     
     logger.info("🔧 Railway Webhook + HTTP API mode")
     
-    # Railway uchun PORT tekshirish
     if not PORT:
         logger.error("❌ PORT o'rnatilmagan!")
         return
     
     app = web.Application()
     
-    # CORS
     cors = aiohttp_cors.setup(app, defaults={
         "*": aiohttp_cors.ResourceOptions(
             allow_credentials=True,
@@ -726,9 +767,8 @@ def main():
         )
     })
     
-    # Routes
     app.router.add_get('/', health_handler)
-    app.router.add_get('/health', health_handler)  # Railway health check
+    app.router.add_get('/health', health_handler)
     app.router.add_get('/api/orders', get_orders_handler)
     app.router.add_get('/api/orders/new', get_new_orders_handler)
     app.router.add_post('/api/orders', create_order_handler)
@@ -736,20 +776,16 @@ def main():
     app.router.add_put('/api/orders/{order_id}', update_order_handler)
     app.router.add_post('/webhook', webhook_handler)
     
-    # CORS
     for route in list(app.router.routes()):
         cors.add(route)
     
-    # Lifecycle
     app.on_startup.append(init_webhook)
     app.on_cleanup.append(shutdown)
     
-    # Railway uchun HOST va PORT
     host = '0.0.0.0'
     
     logger.info(f"🚀 Server ishga tushmoqda: {host}:{PORT}")
     
-    # Railway uchun run_app - MUHIM!
     web.run_app(
         app, 
         host=host, 
