@@ -109,8 +109,6 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
         if conn:
             conn.close()
 
-# ... (avvalgi kod) ...
-
 def create_order(data: Dict) -> Optional[Dict]:
     """Yangi buyurtma yaratish - skrinshot bilan"""
     conn = None
@@ -152,68 +150,6 @@ def create_order(data: Dict) -> Optional[Dict]:
             datetime.utcnow(),
             screenshot,
             screenshot_name
-        ))
-        
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        
-        if result:
-            order_dict = dict(result)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
-            return order_dict
-        return None
-        
-    except Exception as e:
-        logger.error(f"Create order error: {e}")
-        if conn:
-            conn.rollback()
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-# Database jadvali uchun migration:
-
-
-
-def create_order(data: Dict) -> Optional[Dict]:
-    """Yangi buyurtma yaratish"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # items ni JSON formatga o'tkazish
-        items = data.get('items', [])
-        if isinstance(items, list):
-            items_json = json.dumps(items)
-        else:
-            items_json = items
-        
-        cur.execute("""
-            INSERT INTO orders (
-                order_id, name, phone, items, total, 
-                status, payment_status, payment_method, 
-                location, tg_id, notified, created_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING *
-        """, (
-            data.get('orderId'),
-            data.get('name'),
-            data.get('phone'),
-            items_json,
-            data.get('total'),
-            data.get('status', 'payment_pending'),
-            data.get('paymentStatus', 'pending'),
-            data.get('paymentMethod', 'payme'),
-            data.get('location'),
-            data.get('tgId'),
-            False,
-            datetime.utcnow()
         ))
         
         result = cur.fetchone()
