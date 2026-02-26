@@ -2,6 +2,7 @@
 import os
 import logging
 import asyncio
+from flask import app
 import psycopg2
 import psycopg2.extras
 from datetime import datetime
@@ -16,7 +17,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from aiohttp import web
+from aiohttp import request, web
 import aiohttp_cors
 import json
 
@@ -369,6 +370,88 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
+
+
+# app.py ga qo'shing - Payme callback handler
+
+async def payme_callback(request):
+    """Payme dan callback"""
+    try:
+        # Payme POST so'rov yuboradi
+        data = await request.json()
+        logger.info(f"💰 Payme callback: {data}")
+        
+        # Payme formatiga qarab o'zgartiring
+        order_id = None
+        state = None
+        
+        # Payme turli formatlarda yuborishi mumkin
+        if 'account' in data and 'order_id' in data['account']:
+            order_id = data['account']['order_id']
+            state = data.get('state')
+        elif 'order_id' in data:
+            order_id = data['order_id']
+            state = data.get('state')
+        
+        if not order_id:
+            logger.error("❌ Order ID topilmadi")
+            return web.json_response({"error": "No order_id"}, status=400)
+        
+        # state=2 - muvaffaqiyatli to'lov
+        if state == 2:
+            conn = None
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                
+                cur.execute("""
+                    UPDATE orders 
+                    SET payment_status = 'paid', 
+                        status = 'payment_pending',
+                        paid_at = %s,
+                        notified = false
+                    WHERE order_id = %s
+                    RETURNING *
+                """, (datetime.utcnow().isoformat(), order_id))
+                
+                order = cur.fetchone()
+                conn.commit()
+                cur.close()
+                
+                if order:
+                    logger.info(f"✅ To'lov tasdiqlandi: {order_id}")
+                    
+                    # Admin ga xabar yuborish (agar kerak bo'lsa)
+                    # await notify_admin(order)
+                    
+                    # Payme success response
+                    return web.json_response({
+                        "result": {
+                            "success": True,
+                            "order": dict(order)
+                        }
+                    })
+                else:
+                    return web.json_response({"error": "Order not found"}, status=404)
+                    
+            except Exception as e:
+                logger.error(f"❌ Update error: {e}")
+                if conn:
+                    conn.rollback()
+                return web.json_response({"error": str(e)}, status=500)
+            finally:
+                if conn:
+                    conn.close()
+        
+        # Boshqa holatlar
+        return web.json_response({"result": {"success": True}})
+        
+    except Exception as e:
+        logger.error(f"❌ Payme callback error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+# Routelarga qo'shing
+app.router.add_post('/api/payme/callback', payme_callback)
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
