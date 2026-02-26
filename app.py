@@ -1,8 +1,6 @@
-
 import os
 import logging
 import asyncio
-from flask import app
 import psycopg2
 import psycopg2.extras
 from datetime import datetime
@@ -17,7 +15,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from aiohttp import request, web
+from aiohttp import web
 import aiohttp_cors
 import json
 
@@ -29,27 +27,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables - DATABASE_PUBLIC_URL ishlatish!
-DATABASE_URL = os.getenv("DATABASE_PUBLIC_URL") or os.getenv("DATABASE_URL")
+# ==========================================
+# ENVIRONMENT VARIABLES - RAILWAY UCHUN
+# ==========================================
+
+# Railway avtomatik PORT beradi - 8080 default emas!
+PORT = int(os.getenv("PORT", "3000"))
+
+# Database URL - bir nechta variantni tekshirish
+DATABASE_URL = (os.getenv("DATABASE_PUBLIC_URL") or 
+                os.getenv("DATABASE_URL") or 
+                os.getenv("DATABASE_PRIVATE_URL") or
+                os.getenv("POSTGRES_URL"))
+
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
-ADMIN_URL = f"{WEBAPP_URL}/admin.html"
-PORT = int(os.getenv("PORT", "8080"))
+
+# Railway domain avtomatik aniqlash
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL", "")
+
+# WEBHOOK_URL ni aniqlash
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+if not WEBHOOK_URL and RAILWAY_PUBLIC_DOMAIN:
+    WEBHOOK_URL = f"https://{RAILWAY_PUBLIC_DOMAIN}"
+elif not WEBHOOK_URL and RAILWAY_STATIC_URL:
+    WEBHOOK_URL = RAILWAY_STATIC_URL
+
+logger.info(f"🔧 Configuration:")
+logger.info(f"   PORT: {PORT}")
+logger.info(f"   WEBHOOK_URL: {WEBHOOK_URL}")
+logger.info(f"   WEBAPP_URL: {WEBAPP_URL}")
+logger.info(f"   DATABASE_URL set: {bool(DATABASE_URL)}")
+logger.info(f"   TOKEN set: {bool(TOKEN)}")
+logger.info(f"   ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
 
 # Global application
 application = None
 
 # ==========================================
-# DATABASE FUNCTIONS (Simple, no pool)
+# DATABASE FUNCTIONS
 # ==========================================
 
 def get_db_connection():
     """Simple connection - har bir so'rovda yangi connection"""
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL not set!")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        return conn
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+        raise
 
 def format_price(price: int) -> str:
     return f"{price:,}".replace(",", " ")
@@ -122,7 +152,6 @@ def create_order(data: Dict) -> Optional[Dict]:
         
         if result:
             order_dict = dict(result)
-            # datetime larni string ga
             for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
@@ -294,7 +323,7 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
         if isinstance(items, str):
             items = json.loads(items)
         
-        items_text = "\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
+        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
         
         message = f"""🛎️ <b>YANGI BUYURTMA!</b>
 
@@ -314,7 +343,7 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
                 InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
                 InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
             ],
-            [InlineKeyboardButton("🌐 Admin Panel", web_app=WebAppInfo(url=ADMIN_URL))]
+            [InlineKeyboardButton("🌐 Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
         ]
         
         await context.bot.send_message(
@@ -354,10 +383,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin:
         keyboard = [
             [InlineKeyboardButton("🍽️ Menyu", web_app=WebAppInfo(url=WEBAPP_URL))],
-            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=ADMIN_URL))]
+            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
         ]
         await update.message.reply_text(
-            f"👋 Salom, Admin <b>{user.first_name}</b>!\\n\\n"
+            f"👋 Salom, Admin <b>{user.first_name}</b>!\n\n"
             f"🤖 Bot faol. Yangi buyurtmalar avtomatik keladi.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
@@ -365,93 +394,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         keyboard = [[InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]]
         await update.message.reply_text(
-            f"👋 Salom, <b>{user.first_name}</b>!\\n\\n"
+            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
             f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
-
-
-# app.py ga qo'shing - Payme callback handler
-
-async def payme_callback(request):
-    """Payme dan callback"""
-    try:
-        # Payme POST so'rov yuboradi
-        data = await request.json()
-        logger.info(f"💰 Payme callback: {data}")
-        
-        # Payme formatiga qarab o'zgartiring
-        order_id = None
-        state = None
-        
-        # Payme turli formatlarda yuborishi mumkin
-        if 'account' in data and 'order_id' in data['account']:
-            order_id = data['account']['order_id']
-            state = data.get('state')
-        elif 'order_id' in data:
-            order_id = data['order_id']
-            state = data.get('state')
-        
-        if not order_id:
-            logger.error("❌ Order ID topilmadi")
-            return web.json_response({"error": "No order_id"}, status=400)
-        
-        # state=2 - muvaffaqiyatli to'lov
-        if state == 2:
-            conn = None
-            try:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                
-                cur.execute("""
-                    UPDATE orders 
-                    SET payment_status = 'paid', 
-                        status = 'payment_pending',
-                        paid_at = %s,
-                        notified = false
-                    WHERE order_id = %s
-                    RETURNING *
-                """, (datetime.utcnow().isoformat(), order_id))
-                
-                order = cur.fetchone()
-                conn.commit()
-                cur.close()
-                
-                if order:
-                    logger.info(f"✅ To'lov tasdiqlandi: {order_id}")
-                    
-                    # Admin ga xabar yuborish (agar kerak bo'lsa)
-                    # await notify_admin(order)
-                    
-                    # Payme success response
-                    return web.json_response({
-                        "result": {
-                            "success": True,
-                            "order": dict(order)
-                        }
-                    })
-                else:
-                    return web.json_response({"error": "Order not found"}, status=404)
-                    
-            except Exception as e:
-                logger.error(f"❌ Update error: {e}")
-                if conn:
-                    conn.rollback()
-                return web.json_response({"error": str(e)}, status=500)
-            finally:
-                if conn:
-                    conn.close()
-        
-        # Boshqa holatlar
-        return web.json_response({"result": {"success": True}})
-        
-    except Exception as e:
-        logger.error(f"❌ Payme callback error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
-
-# Routelarga qo'shing
-app.router.add_post('/api/payme/callback', payme_callback)
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -477,7 +424,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if isinstance(items, str):
                 items = json.loads(items)
             
-            items_text = "\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
+            items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
             
             message = f"""{status_text}
 
@@ -498,9 +445,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if tg_id:
                 try:
                     if action == 'accept':
-                        msg = f"✅ Buyurtmangiz #{order_id[-6:]} qabul qilindi!\\n\\nTez orada yetkazib beramiz! 🚀"
+                        msg = f"✅ Buyurtmangiz #{order_id[-6:]} qabul qilindi!\n\nTez orada yetkazib beramiz! 🚀"
                     else:
-                        msg = f"❌ Buyurtmangiz #{order_id[-6:]} bekor qilindi.\\n\\nQo'llab-quvvatlash: +998901234567"
+                        msg = f"❌ Buyurtmangiz #{order_id[-6:]} bekor qilindi.\n\nQo'llab-quvvatlash: +998901234567"
                     
                     await context.bot.send_message(chat_id=tg_id, text=msg)
                 except Exception as e:
@@ -523,11 +470,13 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 
 async def health_handler(request):
+    """Health check - Railway uchun muhim!"""
     return web.json_response({
         "status": "ok", 
         "service": "bodrum-bot",
-        "mode": "webhook",
-        "database_url_set": bool(DATABASE_URL)
+        "timestamp": datetime.utcnow().isoformat(),
+        "database_url_set": bool(DATABASE_URL),
+        "webhook_url": WEBHOOK_URL
     })
 
 async def get_orders_handler(request):
@@ -665,16 +614,32 @@ async def webhook_handler(request):
     return web.Response(text='OK')
 
 # ==========================================
-# WEBHOOK INIT
+# WEBHOOK INIT - RAILWAY UCHUN
 # ==========================================
 
 async def init_webhook(app):
     global application
     
-    # WEBHOOK_URL tekshirish
+    # Railway health check uchun server ishga tushsin
+    if not TOKEN:
+        logger.error("❌ TOKEN o'rnatilmagan!")
+        return
+    
     if not WEBHOOK_URL:
-        logger.error("❌ WEBHOOK_URL o'rnatilmagan!")
-        raise ValueError("WEBHOOK_URL not set")
+        logger.warning("⚠️ WEBHOOK_URL o'rnatilmagan! Polling mode ishlatiladi.")
+        # Webhook yo'q bo'lsa, polling mode
+        application = Application.builder().token(TOKEN).build()
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("test", test_command))
+        application.add_handler(CallbackQueryHandler(callback_handler))
+        
+        job_queue = application.job_queue
+        job_queue.run_repeating(check_new_orders, interval=10, first=5)
+        
+        await application.initialize()
+        await application.start()
+        logger.info("🤖 Bot polling mode da ishga tushdi!")
+        return
     
     webhook_url = WEBHOOK_URL.rstrip('/')
     if not webhook_url.startswith('https://'):
@@ -683,12 +648,15 @@ async def init_webhook(app):
     full_webhook_url = f"{webhook_url}/webhook"
     
     logger.info(f"🔧 Webhook URL: {full_webhook_url}")
-    logger.info(f"🔧 Database URL set: {bool(DATABASE_URL)}")
     
     # Eski webhook ni o'chirish
-    temp_app = Application.builder().token(TOKEN).build()
-    await temp_app.bot.delete_webhook(drop_pending_updates=True)
-    await temp_app.shutdown()
+    try:
+        temp_app = Application.builder().token(TOKEN).build()
+        await temp_app.bot.delete_webhook(drop_pending_updates=True)
+        await temp_app.shutdown()
+        logger.info("✅ Eski webhook o'chirildi")
+    except Exception as e:
+        logger.warning(f"⚠️ Eski webhook o'chirishda xato: {e}")
     
     # Yangi application
     application = Application.builder().token(TOKEN).build()
@@ -712,76 +680,77 @@ async def init_webhook(app):
         logger.info(f"✅ Webhook o'rnatildi: {full_webhook_url}")
     except Exception as e:
         logger.error(f"❌ Webhook xato: {e}")
-        raise
+        # Webhook xato bersa ham server ishlayveradi
     
     logger.info("🤖 Bot webhook mode da ishga tushdi!")
 
 async def shutdown(app):
     global application
     if application:
-        await application.stop()
-        await application.shutdown()
-        logger.info("🛑 Bot to'xtatildi")
+        try:
+            await application.stop()
+            await application.shutdown()
+            logger.info("🛑 Bot to'xtatildi")
+        except Exception as e:
+            logger.error(f"Shutdown xato: {e}")
 
 # ==========================================
-# MAIN
+# MAIN - RAILWAY UCHUN
 # ==========================================
 
 def main():
     global application
     
-    use_webhook = bool(WEBHOOK_URL and WEBHOOK_URL.strip())
+    logger.info("🔧 Railway Webhook + HTTP API mode")
     
-    if use_webhook:
-        logger.info("🔧 Webhook + HTTP API mode")
-        
-        app = web.Application()
-        
-        # CORS
-        cors = aiohttp_cors.setup(app, defaults={
-            "*": aiohttp_cors.ResourceOptions(
-                allow_credentials=True,
-                expose_headers="*",
-                allow_headers="*",
-                allow_methods="*"
-            )
-        })
-        
-        # Routes
-        app.router.add_get('/', health_handler)
-        app.router.add_get('/api/orders', get_orders_handler)
-        app.router.add_get('/api/orders/new', get_new_orders_handler)
-        app.router.add_post('/api/orders', create_order_handler)
-        app.router.add_get('/api/orders/{order_id}', get_order_handler)
-        app.router.add_put('/api/orders/{order_id}', update_order_handler)
-        app.router.add_post('/webhook', webhook_handler)
-        
-        # CORS
-        for route in list(app.router.routes()):
-            cors.add(route)
-        
-        # Lifecycle
-        app.on_startup.append(init_webhook)
-        app.on_cleanup.append(shutdown)
-        
-        # Run
-        web.run_app(app, host='0.0.0.0', port=PORT)
-        
-    else:
-        # Polling mode (fallback)
-        logger.info("🔧 Polling mode")
-        
-        application = Application.builder().token(TOKEN).build()
-        
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("test", test_command))
-        application.add_handler(CallbackQueryHandler(callback_handler))
-        
-        job_queue = application.job_queue
-        job_queue.run_repeating(check_new_orders, interval=10, first=5)
-        
-        logger.info("🤖 Bot polling mode da!")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Railway uchun PORT tekshirish
+    if not PORT:
+        logger.error("❌ PORT o'rnatilmagan!")
+        return
+    
+    app = web.Application()
+    
+    # CORS
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*"
+        )
+    })
+    
+    # Routes
+    app.router.add_get('/', health_handler)
+    app.router.add_get('/health', health_handler)  # Railway health check
+    app.router.add_get('/api/orders', get_orders_handler)
+    app.router.add_get('/api/orders/new', get_new_orders_handler)
+    app.router.add_post('/api/orders', create_order_handler)
+    app.router.add_get('/api/orders/{order_id}', get_order_handler)
+    app.router.add_put('/api/orders/{order_id}', update_order_handler)
+    app.router.add_post('/webhook', webhook_handler)
+    
+    # CORS
+    for route in list(app.router.routes()):
+        cors.add(route)
+    
+    # Lifecycle
+    app.on_startup.append(init_webhook)
+    app.on_cleanup.append(shutdown)
+    
+    # Railway uchun HOST va PORT
+    host = '0.0.0.0'
+    
+    logger.info(f"🚀 Server ishga tushmoqda: {host}:{PORT}")
+    
+    # Railway uchun run_app - MUHIM!
+    web.run_app(
+        app, 
+        host=host, 
+        port=PORT,
+        access_log=logger,
+        print=lambda *args: logger.info(' '.join(str(a) for a in args))
+    )
 
 if __name__ == "__main__":
     main()
