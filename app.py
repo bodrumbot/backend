@@ -1,3 +1,5 @@
+# app.py - Yangi importlar va o'zgaruvchilar
+
 import os
 import logging
 import asyncio
@@ -20,6 +22,7 @@ from aiohttp import web
 import aiohttp_cors
 import json
 import base64
+import threading
 
 load_dotenv()
 
@@ -34,7 +37,6 @@ logger = logging.getLogger(__name__)
 # ==========================================
 
 PORT = int(os.getenv("PORT", "3000"))
-
 DATABASE_URL = (os.getenv("DATABASE_PUBLIC_URL") or 
                 os.getenv("DATABASE_URL") or 
                 os.getenv("DATABASE_PRIVATE_URL") or
@@ -44,27 +46,18 @@ TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 
-RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL", "")
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-if not WEBHOOK_URL and RAILWAY_PUBLIC_DOMAIN:
-    WEBHOOK_URL = f"https://{RAILWAY_PUBLIC_DOMAIN}"
-elif not WEBHOOK_URL and RAILWAY_STATIC_URL:
-    WEBHOOK_URL = RAILWAY_STATIC_URL
-
-logger.info(f"🔧 Configuration:")
-logger.info(f"   PORT: {PORT}")
-logger.info(f"   WEBHOOK_URL: {WEBHOOK_URL}")
-logger.info(f"   WEBAPP_URL: {WEBAPP_URL}")
-logger.info(f"   DATABASE_URL set: {bool(DATABASE_URL)}")
-logger.info(f"   TOKEN set: {bool(TOKEN)}")
-logger.info(f"   ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
-
+# Global application
 application = None
 
+# Vaqtinchalik saqlash - to'lov kutayotgan buyurtmalar
+# {order_id: {'tg_id': ..., 'message_id': ..., 'webapp_open': True/False}}
+pending_confirmations = {}
+
+# Lock uchun
+confirmations_lock = threading.Lock()
+
 # ==========================================
-# DATABASE FUNCTIONS
+# DATABASE FUNCTIONS (avvalgidek)
 # ==========================================
 
 def get_db_connection():
@@ -80,25 +73,6 @@ def get_db_connection():
 def format_price(price: int) -> str:
     return f"{price:,}".replace(",", " ")
 
-def check_column_exists(table_name, column_name):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT 1 FROM information_schema.columns 
-            WHERE table_name = %s AND column_name = %s
-        """, (table_name, column_name))
-        result = cur.fetchone()
-        cur.close()
-        return result is not None
-    except Exception as e:
-        logger.error(f"Check column error: {e}")
-        return False
-    finally:
-        if conn:
-            conn.close()
-
 def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     conn = None
     try:
@@ -110,7 +84,7 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
         
         if result:
             order_dict = dict(result)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'initiated_at']:
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
             return order_dict
@@ -118,51 +92,6 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Get order error: {e}")
         return None
-    finally:
-        if conn:
-            conn.close()
-
-def check_order_initiated(order_id: str) -> Optional[Dict]:
-    """Tekshirish - buyurtma allaqachon boshlanganmi"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT order_id, initiated_from, initiated_at, status, name, phone, items, total
-            FROM orders 
-            WHERE order_id = %s
-        """, (order_id,))
-        result = cur.fetchone()
-        cur.close()
-        return dict(result) if result else None
-    except Exception as e:
-        logger.error(f"Check order initiated error: {e}")
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-def mark_order_initiated(order_id: str, source: str) -> bool:
-    """Buyurtma qayerdan boshlanganini belgilash"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE orders 
-            SET initiated_from = %s, initiated_at = %s
-            WHERE order_id = %s
-            RETURNING *
-        """, (source, datetime.utcnow().isoformat(), order_id))
-        conn.commit()
-        cur.close()
-        return True
-    except Exception as e:
-        logger.error(f"Mark order initiated error: {e}")
-        if conn:
-            conn.rollback()
-        return False
     finally:
         if conn:
             conn.close()
@@ -183,65 +112,22 @@ def create_order(data: Dict) -> Optional[Dict]:
         screenshot = data.get('screenshot')
         screenshot_name = data.get('screenshotName', '')
         
-        has_screenshot_col = check_column_exists('orders', 'screenshot')
-        has_screenshot_name_col = check_column_exists('orders', 'screenshot_name')
-        has_initiated_col = check_column_exists('orders', 'initiated_from')
-        
-        logger.info(f"📊 Database columns: screenshot={has_screenshot_col}, initiated_from={has_initiated_col}")
-        
-        if has_screenshot_col and has_screenshot_name_col and has_initiated_col:
-            # Full insert
-            cur.execute("""
-                INSERT INTO orders (
-                    order_id, name, phone, items, total, 
-                    status, payment_status, payment_method, 
-                    location, tg_id, notified, created_at,
-                    screenshot, screenshot_name, initiated_from
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING *
-            """, (
-                data.get('orderId'), data.get('name'), data.get('phone'),
-                items_json, data.get('total'), data.get('status', 'pending_verification'),
-                data.get('paymentStatus', 'pending_verification'), data.get('paymentMethod', 'payme'),
-                data.get('location'), data.get('tgId'), False, datetime.utcnow(),
-                screenshot, screenshot_name, data.get('initiated_from')
-            ))
-        elif has_screenshot_col and has_screenshot_name_col:
-            # Without initiated_from
-            cur.execute("""
-                INSERT INTO orders (
-                    order_id, name, phone, items, total, 
-                    status, payment_status, payment_method, 
-                    location, tg_id, notified, created_at,
-                    screenshot, screenshot_name
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING *
-            """, (
-                data.get('orderId'), data.get('name'), data.get('phone'),
-                items_json, data.get('total'), data.get('status', 'pending_verification'),
-                data.get('paymentStatus', 'pending_verification'), data.get('paymentMethod', 'payme'),
-                data.get('location'), data.get('tgId'), False, datetime.utcnow(),
-                screenshot, screenshot_name
-            ))
-        else:
-            # Basic insert
-            logger.warning("⚠️ Using basic insert without screenshot columns")
-            cur.execute("""
-                INSERT INTO orders (
-                    order_id, name, phone, items, total, 
-                    status, payment_status, payment_method, 
-                    location, tg_id, notified, created_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING *
-            """, (
-                data.get('orderId'), data.get('name'), data.get('phone'),
-                items_json, data.get('total'), data.get('status', 'pending_verification'),
-                data.get('paymentStatus', 'pending_verification'), data.get('paymentMethod', 'payme'),
-                data.get('location'), data.get('tgId'), False, datetime.utcnow()
-            ))
+        cur.execute("""
+            INSERT INTO orders (
+                order_id, name, phone, items, total, 
+                status, payment_status, payment_method, 
+                location, tg_id, notified, created_at,
+                screenshot, screenshot_name, initiated_from
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (
+            data.get('orderId'), data.get('name'), data.get('phone'),
+            items_json, data.get('total'), data.get('status', 'pending_verification'),
+            data.get('paymentStatus', 'pending_verification'), data.get('paymentMethod', 'payme'),
+            data.get('location'), data.get('tgId'), False, datetime.utcnow(),
+            screenshot, screenshot_name, data.get('initiated_from', 'webapp')
+        ))
         
         result = cur.fetchone()
         conn.commit()
@@ -249,7 +135,7 @@ def create_order(data: Dict) -> Optional[Dict]:
         
         if result:
             order_dict = dict(result)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'initiated_at']:
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
             return order_dict
@@ -260,34 +146,6 @@ def create_order(data: Dict) -> Optional[Dict]:
         if conn:
             conn.rollback()
         return None
-    finally:
-        if conn:
-            conn.close()
-
-def get_all_orders() -> List[Dict]:
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM orders 
-            ORDER BY created_at DESC 
-            LIMIT 100
-        """)
-        orders = cur.fetchall()
-        cur.close()
-        
-        result = []
-        for order in orders:
-            order_dict = dict(order)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'initiated_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
-            result.append(order_dict)
-        return result
-    except Exception as e:
-        logger.error(f"Get all orders error: {e}")
-        return []
     finally:
         if conn:
             conn.close()
@@ -303,6 +161,8 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
             update_data['accepted_at'] = datetime.utcnow().isoformat()
         elif status == 'rejected':
             update_data['rejected_at'] = datetime.utcnow().isoformat()
+        elif status == 'confirmed':
+            update_data['confirmed_at'] = datetime.utcnow().isoformat()
         
         for key, val in kwargs.items():
             if val is not None:
@@ -323,7 +183,7 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         
         if result:
             order_dict = dict(result)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'initiated_at']:
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
             return order_dict
@@ -338,153 +198,8 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         if conn:
             conn.close()
 
-def get_new_orders(since: str = None) -> List[Dict]:
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        if since:
-            cur.execute("""
-                SELECT * FROM orders 
-                WHERE status IN ('pending_verification', 'payment_pending')
-                AND created_at > %s
-                ORDER BY created_at DESC
-            """, (since,))
-        else:
-            cur.execute("""
-                SELECT * FROM orders 
-                WHERE status IN ('pending_verification', 'payment_pending')
-                ORDER BY created_at DESC
-            """)
-        
-        orders = cur.fetchall()
-        cur.close()
-        
-        result = []
-        for order in orders:
-            order_dict = dict(order)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'initiated_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
-            result.append(order_dict)
-        return result
-    except Exception as e:
-        logger.error(f"Get new orders error: {e}")
-        return []
-    finally:
-        if conn:
-            conn.close()
-
 # ==========================================
-# ORDER CHECKING
-# ==========================================
-
-last_notified_orders = set()
-last_check_time = None
-
-async def check_new_orders(context: ContextTypes.DEFAULT_TYPE):
-    global last_check_time
-    
-    try:
-        orders = get_new_orders(last_check_time)
-        
-        if orders:
-            logger.info(f"📊 Yangi buyurtmalar: {len(orders)} ta")
-            
-            for order in orders:
-                order_id = order['order_id']
-                
-                if order_id in last_notified_orders:
-                    continue
-                
-                if not order.get('notified'):
-                    await notify_admin(context, order)
-                    last_notified_orders.add(order_id)
-        
-        last_check_time = datetime.utcnow().isoformat()
-        
-    except Exception as e:
-        logger.error(f"❌ Tekshirish xatosi: {e}")
-
-async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
-    try:
-        items = order.get('items', [])
-        if isinstance(items, str):
-            items = json.loads(items)
-        
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
-        
-        has_screenshot = order.get('screenshot') or order.get('screenshot_name')
-        screenshot_indicator = " 📸" if has_screenshot else ""
-        
-        initiated = order.get('initiated_from')
-        source_text = ""
-        if initiated == 'webapp':
-            source_text = "\n📱 <b>Web App</b> orqali"
-        elif initiated == 'bot':
-            source_text = "\n🤖 <b>Bot</b> orqali"
-        
-        message = f"""🛎️ <b>YANGI BUYURTMA!{screenshot_indicator}</b>{source_text}
-
-🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-👤 Mijoz: {order.get('name')}
-📞 Telefon: +998 {order.get('phone')}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅
-
-🍽 Mahsulotlar:
-{items_text}
-
-⏰ {datetime.now().strftime('%H:%M:%S')}"""
-
-        if initiated == 'bot':
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
-                    InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
-                ],
-                [InlineKeyboardButton("🌐 Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
-            ]
-        else:
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
-                    InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
-                ],
-                [
-                    InlineKeyboardButton("📸 Skrinshot so'rash", callback_data=f"request_screenshot_{order.get('order_id')}")
-                ],
-                [InlineKeyboardButton("🌐 Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
-            ]
-        
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-        
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("UPDATE orders SET notified = true WHERE order_id = %s", (order.get('order_id'),))
-            conn.commit()
-            cur.close()
-        except Exception as e:
-            logger.error(f"Mark notified error: {e}")
-        finally:
-            if conn:
-                conn.close()
-        
-        logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
-        
-    except Exception as e:
-        logger.error(f"❌ Xabar yuborish xatosi: {e}")
-
-# ==========================================
-# TELEGRAM HANDLERS
+# TELEGRAM BOT FUNCTIONS
 # ==========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -511,28 +226,175 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
+async def send_payment_confirmation_request(context: ContextTypes.DEFAULT_TYPE, order_id: str, tg_id: int, total: int):
+    """Mijozga to'lov tasdiqlash so'rovi yuborish"""
+    try:
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Ha, to'lov qildim", callback_data=f"confirm_payment_{order_id}"),
+                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel_payment_{order_id}")
+            ]
+        ]
+        
+        message = await context.bot.send_message(
+            chat_id=tg_id,
+            text=f"""💳 <b>To'lov tasdiqlash</b>
+
+🆔 Buyurtma: #{order_id[-6:]}
+💵 Summa: {format_price(total)} so'm
+
+<b>To'lovni amalga oshirdingizmi?</b>
+
+Agar to'lov muvaffaqiyatli bo'lgan bo'lsa, "Ha, to'lov qildim" tugmasini bosing va skrinshot yuboring.""",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        
+        # Saqlash
+        with confirmations_lock:
+            if order_id not in pending_confirmations:
+                pending_confirmations[order_id] = {}
+            pending_confirmations[order_id]['tg_id'] = tg_id
+            pending_confirmations[order_id]['message_id'] = message.message_id
+            pending_confirmations[order_id]['total'] = total
+        
+        logger.info(f"✅ To'lov tasdiqlash so'rovi yuborildi: {order_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Tasdiqlash so'rovi yuborish xatosi: {e}")
+        return False
+
+async def update_confirmation_message(context: ContextTypes.DEFAULT_TYPE, order_id: str, confirmed: bool):
+    """Tasdiqlash xabarini yangilash"""
+    with confirmations_lock:
+        data = pending_confirmations.get(order_id, {})
+        tg_id = data.get('tg_id')
+        message_id = data.get('message_id')
+        
+        if not tg_id or not message_id:
+            return
+        
+        # O'chirish
+        if confirmed:
+            del pending_confirmations[order_id]
+    
+    try:
+        if confirmed:
+            # Xabarni yangilash - Web App da tasdiqlangan
+            await context.bot.edit_message_text(
+                chat_id=tg_id,
+                message_id=message_id,
+                text=f"""✅ <b>To'lov tasdiqlandi!</b>
+
+🆔 Buyurtma: #{order_id[-6:]}
+
+Web App orqali tasdiqlandi. Skrinshot yuklanmoqda...""",
+                parse_mode='HTML'
+            )
+        else:
+            # Bekor qilindi
+            await context.bot.edit_message_text(
+                chat_id=tg_id,
+                message_id=message_id,
+                text=f"""❌ <b>Buyurtma bekor qilindi</b>
+
+🆔 Buyurtma: #{order_id[-6:]}
+
+Yangi buyurtma uchun /start ni bosing.""",
+                parse_mode='HTML'
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ Xabar yangilash xatosi: {e}")
+
+async def delete_confirmation_message(context: ContextTypes.DEFAULT_TYPE, order_id: str):
+    """Tasdiqlash xabarini o'chirish"""
+    with confirmations_lock:
+        data = pending_confirmations.get(order_id, {})
+        tg_id = data.get('tg_id')
+        message_id = data.get('message_id')
+        
+        if not tg_id or not message_id:
+            return
+        
+        del pending_confirmations[order_id]
+    
+    try:
+        await context.bot.delete_message(chat_id=tg_id, message_id=message_id)
+        logger.info(f"✅ Xabar o'chirildi: {order_id}")
+    except Exception as e:
+        logger.error(f"❌ Xabar o'chirish xatosi: {e}")
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback query handler"""
     query = update.callback_query
     await query.answer()
     
     data = query.data
+    user_id = query.from_user.id
     
-    # Payment done from bot
-    if data.startswith("payment_done_"):
-        await handle_payment_confirmation(update, context)
+    # To'lov tasdiqlash (Bot dan)
+    if data.startswith("confirm_payment_"):
+        order_id = data.replace("confirm_payment_", "")
+        
+        # Tekshirish - bu order allaqachon Web App da tasdiqlanganmi
+        order = get_order(order_id)
+        if order and order.get('status') == 'confirmed':
+            await query.edit_message_text(
+                f"""✅ <b>Allaqachon tasdiqlangan!</b>
+
+🆔 Buyurtma: #{order_id[-6:]}
+
+Web App orqali tasdiqlangan.""",
+                parse_mode='HTML'
+            )
+            return
+        
+        # Skrinshot so'rash
+        await query.edit_message_text(
+            f"""📸 <b>Skrinshot yuboring</b>
+
+🆔 Buyurtma: #{order_id[-6:]}
+
+Iltimos, Payme to'lov skrinshotini yuboring.""",
+            parse_mode='HTML'
+        )
+        
+        # Saqlash - skrinshot kutilyapti
+        with confirmations_lock:
+            if order_id not in pending_confirmations:
+                pending_confirmations[order_id] = {}
+            pending_confirmations[order_id]['awaiting_screenshot'] = True
+            pending_confirmations[order_id]['tg_id'] = user_id
+        
         return
     
-    # Cancel payment
+    # Bekor qilish (Bot dan)
     if data.startswith("cancel_payment_"):
-        await handle_cancel_payment(update, context)
+        order_id = data.replace("cancel_payment_", "")
+        
+        # Web App ga xabar yuborish (agar ochiq bo'lsa)
+        # Bu yerda WebSocket yoki boshqa usul kerak
+        # Hozircha faqat bot dagi xabarni yangilaymiz
+        
+        await query.edit_message_text(
+            f"""❌ <b>Buyurtma bekor qilindi</b>
+
+🆔 Buyurtma: #{order_id[-6:]}
+
+Yangi buyurtma uchun /start ni bosing.""",
+            parse_mode='HTML'
+        )
+        
+        # Ma'lumotni tozalash
+        with confirmations_lock:
+            if order_id in pending_confirmations:
+                del pending_confirmations[order_id]
+        
         return
     
-    # Request screenshot (admin)
-    if data.startswith("request_screenshot_"):
-        await handle_request_screenshot(update, context)
-        return
-    
-    # Accept/Reject
+    # Accept/Reject (Admin)
     if data.startswith(("accept_", "reject_")):
         action, order_id = data.split("_", 1)
         order = get_order(order_id)
@@ -570,6 +432,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await query.edit_message_text(message, parse_mode='HTML')
             
+            # Mijozga xabar
             tg_id = order.get('tg_id')
             if tg_id:
                 try:
@@ -584,107 +447,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("❌ Xatolik yuz berdi!")
 
-async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bot da 'Ha, to'lov qildim' bosilganda"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    order_id = data.replace("payment_done_", "")
-    
-    # Tekshirish - allaqachon web app dan boshlanganmi
-    order = check_order_initiated(order_id)
-    
-    if order and order.get('initiated_from') == 'webapp':
-        await query.edit_message_text(
-            "⚠️ Bu buyurtma allaqachon Web App orqali boshlangan.\n"
-            "Iltimos, skrinshotni Web App da yuklang.",
-            parse_mode='HTML'
-        )
-        return
-    
-    if order and order.get('initiated_from') == 'bot':
-        await query.answer("Allaqachon boshlangan!", show_alert=True)
-        return
-    
-    # Bot da boshlash
-    mark_order_initiated(order_id, 'bot')
-    
-    keyboard = [[InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel_payment_{order_id}")]]
-    
-    await query.edit_message_text(
-        f"✅ <b>To'lov tasdiqlandi!</b>\n\n"
-        f"🆔 Buyurtma: #{order_id[-6:]}\n\n"
-        f"📸 <b>Endi skrinshot yuboring:</b>\n"
-        f"Payme dan to'lov muvaffaqiyatli bo'lgani haqida skrinshot yuboring.\n\n"
-        f"⏳ Kutmoqda...",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='HTML'
-    )
-    
-    context.user_data['awaiting_screenshot'] = order_id
-
-async def handle_request_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin skrinshot so'rasa"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    order_id = data.replace("request_screenshot_", "")
-    
-    order = get_order(order_id)
-    if not order:
-        await query.answer("Buyurtma topilmadi!", show_alert=True)
-        return
-    
-    tg_id = order.get('tg_id')
-    if not tg_id:
-        await query.answer("Mijoz ID topilmadi!", show_alert=True)
-        return
-    
-    # Mijozga xabar
-    try:
-        keyboard = [[
-            InlineKeyboardButton("✅ Ha, to'lov qildim", callback_data=f"payment_done_{order_id}"),
-            InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel_payment_{order_id}")
-        ]]
-        
-        await context.bot.send_message(
-            chat_id=tg_id,
-            text=f"📸 <b>Skrinshot talab qilindi</b>\n\n"
-                 f"🆔 Buyurtma: #{order_id[-6:]}\n\n"
-                 f"Iltimos, Payme to'lov skrinshotini yuboring yoki to'lov qilgan bo'lsangiz 'Ha' ni bosing.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-        
-        await query.answer("Mijozga xabar yuborildi!", show_alert=True)
-        
-    except Exception as e:
-        logger.error(f"Screenshot request error: {e}")
-        await query.answer("Xatolik yuz berdi!", show_alert=True)
-
-async def handle_cancel_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    order_id = data.replace("cancel_payment_", "")
-    
-    if 'awaiting_screenshot' in context.user_data:
-        del context.user_data['awaiting_screenshot']
-    
-    await query.edit_message_text(
-        f"❌ Buyurtma #{order_id[-6:]} bekor qilindi.\n"
-        f"Yangi buyurtma uchun /start ni bosing."
-    )
-
 async def handle_screenshot_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bot da skrinshot qabul qilish"""
-    if 'awaiting_screenshot' not in context.user_data:
-        return
+    """Bot dan skrinshot qabul qilish"""
+    user_id = update.effective_user.id
     
-    order_id = context.user_data['awaiting_screenshot']
+    # Qaysi order uchun ekanini topish
+    order_id = None
+    with confirmations_lock:
+        for oid, data in pending_confirmations.items():
+            if data.get('tg_id') == user_id and data.get('awaiting_screenshot'):
+                order_id = oid
+                break
+    
+    if not order_id:
+        # Hech qanday order kutilmayapti
+        return
     
     if update.message.photo:
         photo = update.message.photo[-1]
@@ -693,82 +470,145 @@ async def handle_screenshot_upload(update: Update, context: ContextTypes.DEFAULT
         photo_bytes = await file.download_as_bytearray()
         screenshot_base64 = "data:image/jpeg;base64," + base64.b64encode(photo_bytes).decode()
         
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE orders 
-                SET screenshot = %s, screenshot_name = %s, status = 'pending_verification'
-                WHERE order_id = %s
-                RETURNING *
-            """, (screenshot_base64, f"bot_{photo.file_id}.jpg", order_id))
-            result = cur.fetchone()
-            conn.commit()
-            cur.close()
+        # Order ma'lumotlarini olish
+        with confirmations_lock:
+            data = pending_confirmations.get(order_id, {})
+            total = data.get('total', 0)
+        
+        # Order yaratish
+        order_data = {
+            'orderId': order_id,
+            'name': update.effective_user.first_name or "Foydalanuvchi",
+            'phone': '000000000',  # Bot dan aniq raqam olish kerak
+            'items': [],  # Bu yerda items kerak
+            'total': total,
+            'status': 'pending_verification',
+            'paymentStatus': 'pending_verification',
+            'paymentMethod': 'payme',
+            'location': None,
+            'tgId': user_id,
+            'notified': False,
+            'screenshot': screenshot_base64,
+            'screenshotName': f"bot_{photo.file_id}.jpg",
+            'initiated_from': 'bot'
+        }
+        
+        # Order saqlash
+        order = create_order(order_data)
+        
+        if order:
+            await update.message.reply_text(
+                "✅ <b>Buyurtma qabul qilindi!</b>\n\n"
+                f"🆔 Buyurtma: #{order_id[-6:]}\n"
+                "⏳ Admin tekshiruvida...",
+                parse_mode='HTML'
+            )
             
-            if result:
-                await update.message.reply_text(
-                    "✅ <b>Skrinshot qabul qilindi!</b>\n\n"
-                    f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                    "⏳ Admin tekshiruvida...\n\n"
-                    "Tasdiqlangach yetkazib beramiz!",
-                    parse_mode='HTML'
-                )
-                
-                # Admin ga xabar
-                order = dict(result)
-                items = json.loads(order['items']) if isinstance(order['items'], str) else order['items']
-                items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
-                
-                admin_msg = f"""🛎️ <b>YANGI BUYURTMA! 📸</b>
+            # Admin ga xabar
+            await notify_admin(context, order)
+            
+            # Tozalash
+            with confirmations_lock:
+                if order_id in pending_confirmations:
+                    del pending_confirmations[order_id]
+        else:
+            await update.message.reply_text("❌ Xatolik yuz berdi. Qayta urinib ko'ring.")
 
-🆔 Buyurtma: #{order_id[-6:]}
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
+    """Admin ga xabar yuborish"""
+    try:
+        items = order.get('items', [])
+        if isinstance(items, str):
+            items = json.loads(items)
+        
+        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        
+        has_screenshot = order.get('screenshot') or order.get('screenshot_name')
+        screenshot_indicator = " 📸" if has_screenshot else ""
+        
+        initiated = order.get('initiated_from')
+        source_text = ""
+        if initiated == 'webapp':
+            source_text = "\n📱 <b>Web App</b> orqali"
+        elif initiated == 'bot':
+            source_text = "\n🤖 <b>Bot</b> orqali"
+        
+        message = f"""🛎️ <b>YANGI BUYURTMA!{screenshot_indicator}</b>{source_text}
+
+🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 👤 Mijoz: {order.get('name')}
 📞 Telefon: +998 {order.get('phone')}
 💵 Summa: {format_price(order.get('total', 0))} so'm
-📱 Manba: <b>Bot orqali</b>
+💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅
 
 🍽 Mahsulotlar:
 {items_text}
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}"""
 
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order_id}"),
-                        InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order_id}")
-                    ],
-                    [InlineKeyboardButton("🌐 Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
-                ]
-                
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
+                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
+            ],
+            [InlineKeyboardButton("🌐 Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
+        ]
+        
+        if has_screenshot and order.get('screenshot'):
+            # Skrinshot bilan yuborish
+            try:
+                screenshot_data = order.get('screenshot')
+                if screenshot_data.startswith('data:image'):
+                    image_data = base64.b64decode(screenshot_data.split(',')[1])
+                    
+                    await context.bot.send_photo(
+                        chat_id=ADMIN_CHAT_ID,
+                        photo=image_data,
+                        caption=message,
+                        parse_mode='HTML',
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=message,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode='HTML'
+                    )
+            except Exception as e:
+                logger.error(f"Skrinshot yuborish xatosi: {e}")
                 await context.bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
-                    text=admin_msg,
+                    text=message,
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='HTML'
                 )
-                
+        else:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
+        
+        # notified = true
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("UPDATE orders SET notified = true WHERE order_id = %s", (order.get('order_id'),))
+            conn.commit()
+            cur.close()
         except Exception as e:
-            logger.error(f"Screenshot save error: {e}")
-            await update.message.reply_text("❌ Xatolik yuz berdi. Iltimos qayta urinib ko'ring.")
+            logger.error(f"Mark notified error: {e}")
         finally:
             if conn:
                 conn.close()
         
-        del context.user_data['awaiting_screenshot']
+        logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
         
-    else:
-        await update.message.reply_text("📸 Iltimos, rasm yuboring (skrinshot).")
-
-async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != ADMIN_CHAT_ID:
-        return
-    
-    await update.message.reply_text("🔍 Tekshirilmoqda...")
-    await check_new_orders(context)
-    await update.message.reply_text("✅ Tekshirish tugadi!")
+    except Exception as e:
+        logger.error(f"❌ Xabar yuborish xatosi: {e}")
 
 # ==========================================
 # HTTP API HANDLERS
@@ -778,26 +618,8 @@ async def health_handler(request):
     return web.json_response({
         "status": "ok", 
         "service": "bodrum-bot",
-        "timestamp": datetime.utcnow().isoformat(),
-        "database_url_set": bool(DATABASE_URL),
-        "webhook_url": WEBHOOK_URL
-    })
-
-async def get_orders_handler(request):
-    try:
-        orders = get_all_orders()
-        return web.json_response(orders)
-    except Exception as e:
-        logger.error(f"API get orders error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
-
-async def get_new_orders_handler(request):
-    try:
-        orders = get_new_orders()
-        return web.json_response(orders)
-    except Exception as e:
-        logger.error(f"API get new orders error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        "timestamp": datetime.utcnow().isoformat()
+    }, headers={'Access-Control-Allow-Origin': '*'})
 
 async def create_order_handler(request):
     try:
@@ -808,13 +630,22 @@ async def create_order_handler(request):
         
         if order:
             logger.info(f"✅ Buyurtma yaratildi: {order['order_id']}")
-            return web.json_response(order, status=201)
+            
+            # Telegram bot ga xabar yuborish
+            global application
+            if application and order.get('tgId'):
+                try:
+                    await notify_admin(application, order)
+                except Exception as e:
+                    logger.error(f"Admin ga xabar yuborish xatosi: {e}")
+            
+            return web.json_response(order, status=201, headers={'Access-Control-Allow-Origin': '*'})
         else:
-            return web.json_response({"error": "Failed to create order"}, status=500)
+            return web.json_response({"error": "Failed to create order"}, status=500, headers={'Access-Control-Allow-Origin': '*'})
         
     except Exception as e:
         logger.error(f"API create order error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": str(e)}, status=500, headers={'Access-Control-Allow-Origin': '*'})
 
 async def get_order_handler(request):
     try:
@@ -822,133 +653,72 @@ async def get_order_handler(request):
         order = get_order(order_id)
         
         if not order:
-            return web.json_response({"error": "Not found"}, status=404)
+            return web.json_response({"error": "Not found"}, status=404, headers={'Access-Control-Allow-Origin': '*'})
         
-        return web.json_response(order)
+        return web.json_response(order, headers={'Access-Control-Allow-Origin': '*'})
     except Exception as e:
         logger.error(f"API get order error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": str(e)}, status=500, headers={'Access-Control-Allow-Origin': '*'})
 
-async def check_order_initiated_handler(request):
-    """Tekshirish - buyurtma allaqachon boshlanganmi"""
-    try:
-        order_id = request.match_info['order_id']
-        order = check_order_initiated(order_id)
-        
-        if not order:
-            return web.json_response({"error": "Not found"}, status=404)
-        
-        return web.json_response({
-            "order_id": order.get('order_id'),
-            "initiated_from": order.get('initiated_from'),
-            "initiated_at": order.get('initiated_at'),
-            "status": order.get('status')
-        })
-        
-    except Exception as e:
-        logger.error(f"API check initiated error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
-
-async def mark_order_initiated_handler(request):
-    """Buyurtma boshlanganini belgilash"""
+async def confirm_payment_handler(request):
+    """Web App dan to'lov tasdiqlash"""
     try:
         data = await request.json()
         order_id = data.get('orderId')
-        source = data.get('source')
+        tg_id = data.get('tgId')
         
-        if not order_id or not source:
-            return web.json_response({"error": "Missing orderId or source"}, status=400)
+        logger.info(f"✅ Web App dan tasdiqlash: {order_id}")
         
-        existing = check_order_initiated(order_id)
-        if existing and existing.get('initiated_from'):
+        # Bot dagi xabarni yangilash
+        global application
+        if application and tg_id:
+            try:
+                await update_confirmation_message(application, order_id, confirmed=True)
+            except Exception as e:
+                logger.error(f"Xabar yangilash xatosi: {e}")
+        
+        return web.json_response({
+            "success": True,
+            "message": "Payment confirmed"
+        }, headers={'Access-Control-Allow-Origin': '*'})
+        
+    except Exception as e:
+        logger.error(f"Confirm payment error: {e}")
+        return web.json_response({"error": str(e)}, status=500, headers={'Access-Control-Allow-Origin': '*'})
+
+async def send_bot_confirmation_handler(request):
+    """Bot dan to'lov tasdiqlash xabarini yuborish"""
+    try:
+        data = await request.json()
+        order_id = data.get('orderId')
+        tg_id = data.get('tgId')
+        total = data.get('total', 0)
+        
+        logger.info(f"📤 Bot tasdiqlash so'rovi: {order_id}, tg_id: {tg_id}")
+        
+        global application
+        if application and tg_id:
+            success = await send_payment_confirmation_request(application, order_id, tg_id, total)
+            
+            if success:
+                return web.json_response({
+                    "success": True,
+                    "message": "Confirmation request sent"
+                }, headers={'Access-Control-Allow-Origin': '*'})
+            else:
+                return web.json_response({
+                    "success": False,
+                    "error": "Failed to send message"
+                }, status=500, headers={'Access-Control-Allow-Origin': '*'})
+        else:
             return web.json_response({
                 "success": False,
-                "message": "Order already initiated from " + existing.get('initiated_from'),
-                "initiated_from": existing.get('initiated_from')
-            })
+                "error": "Bot not available"
+            }, status=500, headers={'Access-Control-Allow-Origin': '*'})
         
-        success = mark_order_initiated(order_id, source)
-        
-        if success:
-            return web.json_response({
-                "success": True,
-                "message": f"Order marked as initiated from {source}"
-            })
-        else:
-            return web.json_response({"error": "Failed to mark"}, status=500)
-            
     except Exception as e:
-        logger.error(f"API mark initiated error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
-
-async def update_order_handler(request):
-    try:
-        order_id = request.match_info['order_id']
-        data = await request.json()
-        
-        logger.info(f"📝 Buyurtma yangilanmoqda: {order_id} - {data}")
-        
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            
-            updates = []
-            values = []
-            
-            if 'status' in data:
-                updates.append("status = %s")
-                values.append(data['status'])
-            if 'paymentStatus' in data:
-                updates.append("payment_status = %s")
-                values.append(data['paymentStatus'])
-            if 'payment_method' in data:
-                updates.append("payment_method = %s")
-                values.append(data['payment_method'])
-            if 'acceptedAt' in data:
-                updates.append("accepted_at = %s")
-                values.append(data['acceptedAt'])
-            if 'rejectedAt' in data:
-                updates.append("rejected_at = %s")
-                values.append(data['rejectedAt'])
-            if 'paidAt' in data:
-                updates.append("paid_at = %s")
-                values.append(data['paidAt'])
-            
-            if not updates:
-                return web.json_response({"error": "No updates"}, status=400)
-            
-            values.append(order_id)
-            query = f"UPDATE orders SET {', '.join(updates)} WHERE order_id = %s RETURNING *"
-            
-            cur.execute(query, values)
-            result = cur.fetchone()
-            conn.commit()
-            cur.close()
-            
-            if not result:
-                return web.json_response({"error": "Order not found"}, status=404)
-            
-            order_dict = dict(result)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'initiated_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
-            
-            logger.info(f"✅ Buyurtma yangilandi: {order_id}")
-            return web.json_response(order_dict)
-            
-        except Exception as e:
-            logger.error(f"Update handler error: {e}")
-            if conn:
-                conn.rollback()
-            return web.json_response({"error": str(e)}, status=500)
-        finally:
-            if conn:
-                conn.close()
-                
-    except Exception as e:
-        logger.error(f"API update order error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        logger.error(f"Send bot confirmation error: {e}")
+        return web.json_response({"error": str(e)}, status=500, headers={'Access-Control-Allow-Origin': '*'})
 
 async def webhook_handler(request):
     global application
@@ -964,7 +734,7 @@ async def webhook_handler(request):
     return web.Response(text='OK')
 
 # ==========================================
-# WEBHOOK INIT
+# MAIN
 # ==========================================
 
 async def init_webhook(app):
@@ -974,58 +744,33 @@ async def init_webhook(app):
         logger.error("❌ TOKEN o'rnatilmagan!")
         return
     
-    if not WEBHOOK_URL:
-        logger.warning("⚠️ WEBHOOK_URL o'rnatilmagan! Polling mode ishlatiladi.")
-        application = Application.builder().token(TOKEN).build()
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("test", test_command))
-        application.add_handler(CallbackQueryHandler(callback_handler))
-        application.add_handler(MessageHandler(filters.PHOTO, handle_screenshot_upload))
-        
-        job_queue = application.job_queue
-        job_queue.run_repeating(check_new_orders, interval=10, first=5)
-        
-        await application.initialize()
-        await application.start()
-        logger.info("🤖 Bot polling mode da ishga tushdi!")
-        return
-    
-    webhook_url = WEBHOOK_URL.rstrip('/')
-    if not webhook_url.startswith('https://'):
-        webhook_url = 'https://' + webhook_url
-    
-    full_webhook_url = f"{webhook_url}/webhook"
-    
-    logger.info(f"🔧 Webhook URL: {full_webhook_url}")
-    
-    try:
-        temp_app = Application.builder().token(TOKEN).build()
-        await temp_app.bot.delete_webhook(drop_pending_updates=True)
-        await temp_app.shutdown()
-        logger.info("✅ Eski webhook o'chirildi")
-    except Exception as e:
-        logger.warning(f"⚠️ Eski webhook o'chirishda xato: {e}")
+    # Webhook URL
+    webhook_url = os.getenv("WEBHOOK_URL", "")
+    if not webhook_url:
+        # Railway domain
+        railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+        if railway_domain:
+            webhook_url = f"https://{railway_domain}"
     
     application = Application.builder().token(TOKEN).build()
     
+    # Handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.PHOTO, handle_screenshot_upload))
-    
-    job_queue = application.job_queue
-    job_queue.run_repeating(check_new_orders, interval=10, first=5)
     
     await application.initialize()
     await application.start()
     
-    try:
-        await application.bot.set_webhook(full_webhook_url)
-        logger.info(f"✅ Webhook o'rnatildi: {full_webhook_url}")
-    except Exception as e:
-        logger.error(f"❌ Webhook xato: {e}")
+    if webhook_url:
+        full_webhook_url = f"{webhook_url}/webhook"
+        try:
+            await application.bot.set_webhook(full_webhook_url)
+            logger.info(f"✅ Webhook o'rnatildi: {full_webhook_url}")
+        except Exception as e:
+            logger.error(f"❌ Webhook xato: {e}")
     
-    logger.info("🤖 Bot webhook mode da ishga tushdi!")
+    logger.info("🤖 Bot ishga tushdi!")
 
 async def shutdown(app):
     global application
@@ -1037,14 +782,8 @@ async def shutdown(app):
         except Exception as e:
             logger.error(f"Shutdown xato: {e}")
 
-# ==========================================
-# MAIN
-# ==========================================
-
 def main():
-    global application
-    
-    logger.info("🔧 Railway Webhook + HTTP API mode")
+    logger.info("🔧 Bodrum Bot starting...")
     
     if not PORT:
         logger.error("❌ PORT o'rnatilmagan!")
@@ -1052,6 +791,7 @@ def main():
     
     app = web.Application()
     
+    # CORS
     cors = aiohttp_cors.setup(app, defaults={
         "*": aiohttp_cors.ResourceOptions(
             allow_credentials=True,
@@ -1064,13 +804,10 @@ def main():
     # Routes
     app.router.add_get('/', health_handler)
     app.router.add_get('/health', health_handler)
-    app.router.add_get('/api/orders', get_orders_handler)
-    app.router.add_get('/api/orders/new', get_new_orders_handler)
     app.router.add_post('/api/orders', create_order_handler)
     app.router.add_get('/api/orders/{order_id}', get_order_handler)
-    app.router.add_get('/api/orders/{order_id}/initiated', check_order_initiated_handler)
-    app.router.add_post('/api/orders/initiated', mark_order_initiated_handler)
-    app.router.add_put('/api/orders/{order_id}', update_order_handler)
+    app.router.add_post('/api/confirm-payment', confirm_payment_handler)
+    app.router.add_post('/api/send-bot-confirmation', send_bot_confirmation_handler)
     app.router.add_post('/webhook', webhook_handler)
     
     for route in list(app.router.routes()):
@@ -1079,17 +816,9 @@ def main():
     app.on_startup.append(init_webhook)
     app.on_cleanup.append(shutdown)
     
-    host = '0.0.0.0'
+    logger.info(f"🚀 Server ishga tushmoqda: 0.0.0.0:{PORT}")
     
-    logger.info(f"🚀 Server ishga tushmoqda: {host}:{PORT}")
-    
-    web.run_app(
-        app, 
-        host=host, 
-        port=PORT,
-        access_log=logger,
-        print=lambda *args: logger.info(' '.join(str(a) for a in args))
-    )
+    web.run_app(app, host='0.0.0.0', port=PORT)
 
 if __name__ == "__main__":
     main()
