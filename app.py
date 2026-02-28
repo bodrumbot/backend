@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -51,6 +51,9 @@ pending_confirmations = {}
 
 # Lock uchun
 confirmations_lock = threading.Lock()
+
+# Foydalanuvchi ma'lumotlari (Telegram ID -> {name, phone})
+user_profiles = {}
 
 # ==========================================
 # CORS HEADERS
@@ -284,6 +287,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_admin = user.id == ADMIN_CHAT_ID
     
+    # Admin uchun
     if is_admin:
         keyboard = [
             [InlineKeyboardButton("🍽️ Menyu", web_app=WebAppInfo(url=WEBAPP_URL))],
@@ -295,14 +299,81 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
-    else:
-        keyboard = [[InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]]
-        await update.message.reply_text(
-            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
-            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
+        return
+    
+    # Oddiy foydalanuvchi uchun - contact so'rash
+    # Avval saqlangan ma'lumotni tekshirish
+    if user.id in user_profiles:
+        # Ma'lumot mavjud - Web App'ga o'tish
+        await send_webapp_button(update, context, user.id)
+        return
+    
+    # Contact so'rash
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    
+    await update.message.reply_text(
+        f"👋 Salom, <b>{user.first_name}</b>!\n\n"
+        f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
+        f"📱 Buyurtma berish uchun telefon raqamingizni yuboring:",
+        reply_markup=keyboard,
+        parse_mode='HTML'
+    )
+
+async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Contact (telefon raqam) qabul qilish"""
+    user = update.effective_user
+    contact = update.message.contact
+    
+    if not contact:
+        return
+    
+    # Telefon raqamni saqlash
+    phone = contact.phone_number
+    
+    # + belgisi bilan boshlansa, olib tashlaymiz
+    if phone.startswith('+'):
+        phone = phone[1:]
+    
+    # 998 bilan boshlansa, olib tashlaymiz
+    if phone.startswith('998'):
+        phone = phone[3:]
+    
+    # Faqat 9 ta raqam qoldiriladi
+    phone = phone[-9:] if len(phone) > 9 else phone
+    
+    # Profilni saqlash
+    user_profiles[user.id] = {
+        'name': user.first_name or "Foydalanuvchi",
+        'phone': phone,
+        'username': user.username
+    }
+    
+    logger.info(f"✅ Profil saqlandi: {user.id} - {user.first_name} - {phone}")
+    
+    # Web App tugmasini yuborish
+    await send_webapp_button(update, context, user.id)
+
+async def send_webapp_button(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Web App tugmasini yuborish"""
+    profile = user_profiles.get(user_id, {})
+    name = profile.get('name', 'Foydalanuvchi')
+    
+    keyboard = [
+        [InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]
+    ]
+    
+    await update.message.reply_text(
+        f"✅ <b>Ma'lumotlar saqlandi!</b>\n\n"
+        f"👤 Ism: {name}\n"
+        f"📞 Telefon: +998 {profile.get('phone', '---')}\n\n"
+        f"🍽️ Endi menyudan buyurtma berishingiz mumkin:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
 
 async def send_payment_confirmation_request(context: ContextTypes.DEFAULT_TYPE, order_id: str, tg_id: int, total: int, items: list = None):
     """Mijozga to'lov tasdiqlash so'rovi yuborish (Bot orqali)"""
@@ -553,11 +624,15 @@ async def handle_screenshot_upload(update: Update, context: ContextTypes.DEFAULT
     items = pending_data.get('items', [])
     name = pending_data.get('name') or update.effective_user.first_name or "Foydalanuvchi"
     
+    # Telefon raqamni olish (profildan)
+    profile = user_profiles.get(user_id, {})
+    phone = profile.get('phone', '000000000')
+    
     # ORDERNI AVToMATIK SAQLASH
     order_data = {
         'orderId': order_id,
         'name': name,
-        'phone': '000000000',  # Bot dan telefon olinmadi, default
+        'phone': phone,
         'items': items,
         'total': total,
         'status': 'pending_verification',
@@ -837,6 +912,26 @@ async def check_bot_confirmation_handler(request):
         logger.error(f"Check bot confirmation error: {e}")
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
+async def get_user_profile_handler(request):
+    """Foydalanuvchi profilini olish (Telegram ID orqali)"""
+    try:
+        data = await request.json()
+        tg_id = data.get('tgId')
+        
+        if not tg_id:
+            return web.json_response({"error": "tgId required"}, status=400, headers=get_cors_headers())
+        
+        profile = user_profiles.get(int(tg_id), {})
+        
+        return web.json_response({
+            "success": True,
+            "profile": profile
+        }, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"Get user profile error: {e}")
+        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+
 async def orders_list_handler(request):
     """Barcha buyurtmalarni olish - FAQAT QABUL QILINGANLAR"""
     try:
@@ -965,6 +1060,7 @@ async def init_webhook(app):
     
     # Handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.PHOTO, handle_screenshot_upload))
     
@@ -1014,6 +1110,10 @@ def main():
     # CORS preflight uchun OPTIONS
     app.router.add_options('/api/orders', options_handler)
     app.router.add_options('/api/orders/{order_id}', options_handler)
+    
+    # User profile
+    app.router.add_post('/api/user/profile', get_user_profile_handler)
+    app.router.add_options('/api/user/profile', options_handler)
     
     # Confirmation routes
     app.router.add_post('/api/confirm-payment', confirm_payment_handler)
