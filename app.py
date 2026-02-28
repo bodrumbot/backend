@@ -65,17 +65,17 @@ def get_cors_headers():
     }
 
 # ==========================================
-# DATABASE FUNCTIONS - JADVALLAR YARATISH
+# DATABASE FUNCTIONS - JADVALLAR VA COLUMN'LAR YARATISH
 # ==========================================
 
 def init_database():
-    """Jadval yo'q bo'lsa avtomatik yaratish"""
+    """Jadval va column'larni avtomatik yaratish/yangilash"""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Orders jadvali
+        # 1. Orders jadvali (agar yo'q bo'lsa)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id SERIAL PRIMARY KEY,
@@ -95,14 +95,36 @@ def init_database():
                 rejected_at TIMESTAMP,
                 paid_at TIMESTAMP,
                 confirmed_at TIMESTAMP,
-                admin_note TEXT,
-                screenshot TEXT,
-                screenshot_name VARCHAR(255),
-                initiated_from VARCHAR(50) DEFAULT 'webapp'
+                admin_note TEXT
             )
         """)
         
-        # Index'lar
+        # 2. ⭐ YANGI COLUMN'LARNI QO'SHISH (agar yo'q bo'lsa)
+        new_columns = [
+            ('screenshot', 'TEXT'),
+            ('screenshot_name', 'VARCHAR(255)'),
+            ('initiated_from', 'VARCHAR(50) DEFAULT \'webapp\'')
+        ]
+        
+        for col_name, col_type in new_columns:
+            try:
+                # Column mavjudligini tekshirish
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'orders' AND column_name = %s
+                """, (col_name,))
+                
+                if not cur.fetchone():
+                    # Column yo'q, qo'shish
+                    cur.execute(f"ALTER TABLE orders ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"✅ Column '{col_name}' qo'shildi")
+                else:
+                    logger.info(f"ℹ️ Column '{col_name}' allaqachon mavjud")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Column '{col_name}' qo'shishda xato: {e}")
+        
+        # 3. Index'lar
         cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
@@ -113,7 +135,7 @@ def init_database():
         return True
         
     except Exception as e:
-        logger.error(f"Database init error: {e}")
+        logger.error(f"❌ Database init error: {e}")
         return False
     finally:
         if conn:
@@ -170,6 +192,7 @@ def create_order(data: Dict) -> Optional[Dict]:
         
         screenshot = data.get('screenshot')
         screenshot_name = data.get('screenshotName', '')
+        initiated_from = data.get('initiated_from', 'webapp')
         
         cur.execute("""
             INSERT INTO orders (
@@ -185,7 +208,7 @@ def create_order(data: Dict) -> Optional[Dict]:
             items_json, data.get('total'), data.get('status', 'pending_verification'),
             data.get('paymentStatus', 'pending_verification'), data.get('paymentMethod', 'payme'),
             data.get('location'), data.get('tgId'), False, datetime.utcnow(),
-            screenshot, screenshot_name, data.get('initiated_from', 'webapp')
+            screenshot, screenshot_name, initiated_from
         ))
         
         result = cur.fetchone()
@@ -325,7 +348,7 @@ Agar to'lov muvaffaqiyatli bo'lgan bo'lsa, "Ha, to'lov qildim" tugmasini bosing 
             pending_confirmations[order_id]['total'] = total
             pending_confirmations[order_id]['items'] = items
             pending_confirmations[order_id]['status'] = 'waiting_confirmation'
-            pending_confirmations[order_id]['name'] = None  # Ism keyinroq olinadi
+            pending_confirmations[order_id]['name'] = None
         
         logger.info(f"✅ Bot tasdiqlash so'rovi yuborildi: {order_id}")
         return True
@@ -342,11 +365,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user = update.effective_user
     
-    # To'lov tasdiqlash (Bot dan) - ⭐ FAQAT SKRINSHOT SO'RASH, WEB APP'GA O'TMASLIK
+    # To'lov tasdiqlash (Bot dan) - FAQAT SKRINSHOT SO'RASH, WEB APP'GA O'TMASLIK
     if data.startswith("confirm_payment_"):
         order_id = data.replace("confirm_payment_", "")
         
-        # Tekshirish - bu order allaqachon Web App da tasdiqlanganmi
+        # Tekshirish - bu order allaqachon saqlanganmi
         order = get_order(order_id)
         if order:
             await query.edit_message_text(
@@ -359,7 +382,7 @@ Buyurtma qabul qilindi.""",
             )
             return
         
-        # ⭐ FAQAT SKRINSHOT SO'RASH - Web App'ga o'tish yo'q!
+        # FAQAT SKRINSHOT SO'RASH - Web App'ga o'tish yo'q!
         with confirmations_lock:
             if order_id not in pending_confirmations:
                 pending_confirmations[order_id] = {}
@@ -456,7 +479,7 @@ Yangi buyurtma uchun /start ni bosing.""",
             await query.edit_message_text("❌ Xatolik yuz berdi!")
 
 async def handle_screenshot_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bot dan skrinshot qabul qilish - ⭐ AVtomatik order saqlash"""
+    """Bot dan skrinshot qabul qilish - AVtomatik order saqlash"""
     user_id = update.effective_user.id
     
     # Qaysi order uchun ekanini topish
@@ -497,7 +520,7 @@ async def handle_screenshot_upload(update: Update, context: ContextTypes.DEFAULT
     items = pending_data.get('items', [])
     name = pending_data.get('name') or update.effective_user.first_name or "Foydalanuvchi"
     
-    # ⭐ ORDERNI AVToMATIK SAQLASH
+    # ORDERNI AVToMATIK SAQLASH
     order_data = {
         'orderId': order_id,
         'name': name,
@@ -703,7 +726,6 @@ async def confirm_payment_handler(request):
         global application
         if application and tg_id:
             try:
-                # Xabarni o'chirishga harakat qilish
                 with confirmations_lock:
                     pending_data = pending_confirmations.get(order_id, {})
                     message_id = pending_data.get('message_id')
@@ -888,10 +910,9 @@ async def init_webhook(app):
         logger.error("❌ TOKEN o'rnatilmagan!")
         return
     
-    # ⭐ DATABASE NI INITSIALIZATSIYA QILISH
+    # ⭐ DATABASE NI INITSIALIZATSIYA QILISH (jadval + column'lar)
     if not init_database():
         logger.error("❌ Database initialization failed!")
-        # Davom etishga ruxsat beramiz, lekin xatolik log qilinadi
     
     # Webhook URL
     webhook_url = os.getenv("WEBHOOK_URL", "")
