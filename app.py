@@ -65,7 +65,7 @@ def get_cors_headers():
     }
 
 # ==========================================
-# DATABASE FUNCTIONS - JADVALLAR VA COLUMN'LAR YARATISH
+# DATABASE FUNCTIONS
 # ==========================================
 
 def init_database():
@@ -99,7 +99,7 @@ def init_database():
             )
         """)
         
-        # 2. ⭐ YANGI COLUMN'LARNI QO'SHISH (agar yo'q bo'lsa)
+        # 2. Yangi column'larni qo'shish (agar yo'q bo'lsa)
         new_columns = [
             ('screenshot', 'TEXT'),
             ('screenshot_name', 'VARCHAR(255)'),
@@ -108,18 +108,14 @@ def init_database():
         
         for col_name, col_type in new_columns:
             try:
-                # Column mavjudligini tekshirish
                 cur.execute("""
                     SELECT column_name FROM information_schema.columns 
                     WHERE table_name = 'orders' AND column_name = %s
                 """, (col_name,))
                 
                 if not cur.fetchone():
-                    # Column yo'q, qo'shish
                     cur.execute(f"ALTER TABLE orders ADD COLUMN {col_name} {col_type}")
                     logger.info(f"✅ Column '{col_name}' qo'shildi")
-                else:
-                    logger.info(f"ℹ️ Column '{col_name}' allaqachon mavjud")
                     
             except Exception as e:
                 logger.warning(f"⚠️ Column '{col_name}' qo'shishda xato: {e}")
@@ -365,21 +361,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user = update.effective_user
     
-    # To'lov tasdiqlash (Bot dan) - FAQAT SKRINSHOT SO'RASH, WEB APP'GA O'TMASLIK
+    # To'lov tasdiqlash (Bot dan)
     if data.startswith("confirm_payment_"):
         order_id = data.replace("confirm_payment_", "")
         
         # Tekshirish - bu order allaqachon saqlanganmi
         order = get_order(order_id)
         if order:
-            await query.edit_message_text(
-                f"""✅ <b>Allaqachon tasdiqlangan!</b>
+            # Xabarni yangilash - faqat skrinshot so'rash
+            try:
+                await query.edit_message_text(
+                    f"""✅ <b>Allaqachon tasdiqlangan!</b>
 
 🆔 Buyurtma: #{order_id[-6:]}
 
 Buyurtma qabul qilindi.""",
-                parse_mode='HTML'
-            )
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                logger.warning(f"Message edit error (already confirmed): {e}")
+                # Agar edit qilish mumkin bo'lmasa, yangi xabar yuborish
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text="✅ Buyurtma allaqachon tasdiqlangan!"
+                )
             return
         
         # FAQAT SKRINSHOT SO'RASH - Web App'ga o'tish yo'q!
@@ -392,16 +397,24 @@ Buyurtma qabul qilindi.""",
             pending_confirmations[order_id]['name'] = user.first_name or "Foydalanuvchi"
         
         # Xabarni yangilash - faqat skrinshot so'rash
-        await query.edit_message_text(
-            f"""📸 <b>Skrinshot yuboring</b>
+        try:
+            await query.edit_message_text(
+                f"""📸 <b>Skrinshot yuboring</b>
 
 🆔 Buyurtma: #{order_id[-6:]}
 
 Iltimos, Payme to'lov skrinshotini yuboring.
 
 ⏳ Skrinshotni kutib turganda buyurtma saqlanadi...""",
-            parse_mode='HTML'
-        )
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.warning(f"Message edit error (screenshot request): {e}")
+            # Agar edit qilish mumkin bo'lmasa, yangi xabar yuborish
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="📸 Iltimos, Payme to'lov skrinshotini yuboring."
+            )
         
         return
     
@@ -409,14 +422,21 @@ Iltimos, Payme to'lov skrinshotini yuboring.
     if data.startswith("cancel_payment_"):
         order_id = data.replace("cancel_payment_", "")
         
-        await query.edit_message_text(
-            f"""❌ <b>Buyurtma bekor qilindi</b>
+        try:
+            await query.edit_message_text(
+                f"""❌ <b>Buyurtma bekor qilindi</b>
 
 🆔 Buyurtma: #{order_id[-6:]}
 
 Yangi buyurtma uchun /start ni bosing.""",
-            parse_mode='HTML'
-        )
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.warning(f"Message edit error (cancel): {e}")
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="❌ Buyurtma bekor qilindi."
+            )
         
         # Ma'lumotni tozalash
         with confirmations_lock:
@@ -431,7 +451,11 @@ Yangi buyurtma uchun /start ni bosing.""",
         order = get_order(order_id)
         
         if not order:
-            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            try:
+                await query.edit_message_text("❌ Buyurtma topilmadi!")
+            except Exception as e:
+                logger.warning(f"Message edit error (order not found): {e}")
+                await context.bot.send_message(chat_id=user.id, text="❌ Buyurtma topilmadi!")
             return
         
         new_status = 'accepted' if action == 'accept' else 'rejected'
@@ -444,7 +468,7 @@ Yangi buyurtma uchun /start ni bosing.""",
             if isinstance(items, str):
                 items = json.loads(items)
             
-            items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items])
+            items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
             
             has_screenshot = order.get('screenshot') or order.get('screenshot_name')
             screenshot_info = "\n\n📸 Skrinshot: Mavjud" if has_screenshot else ""
@@ -461,7 +485,12 @@ Yangi buyurtma uchun /start ni bosing.""",
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}"""
             
-            await query.edit_message_text(message, parse_mode='HTML')
+            try:
+                await query.edit_message_text(message, parse_mode='HTML')
+            except Exception as e:
+                logger.warning(f"Message edit error (accept/reject): {e}")
+                # Agar edit qilish mumkin bo'lmasa, yangi xabar yuborish
+                await context.bot.send_message(chat_id=user.id, text=message, parse_mode='HTML')
             
             # Mijozga xabar
             tg_id = order.get('tg_id')
@@ -476,7 +505,11 @@ Yangi buyurtma uchun /start ni bosing.""",
                 except Exception as e:
                     logger.error(f"Mijozga xabar yuborishda xato: {e}")
         else:
-            await query.edit_message_text("❌ Xatolik yuz berdi!")
+            try:
+                await query.edit_message_text("❌ Xatolik yuz berdi!")
+            except Exception as e:
+                logger.warning(f"Message edit error (general error): {e}")
+                await context.bot.send_message(chat_id=user.id, text="❌ Xatolik yuz berdi!")
 
 async def handle_screenshot_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Bot dan skrinshot qabul qilish - AVtomatik order saqlash"""
@@ -805,11 +838,17 @@ async def check_bot_confirmation_handler(request):
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
 async def orders_list_handler(request):
-    """Barcha buyurtmalarni olish"""
+    """Barcha buyurtmalarni olish - FAQAT QABUL QILINGANLAR"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 100")
+        # ⭐ FAQAT 'accepted' statusdagi buyurtmalarni olish
+        cur.execute("""
+            SELECT * FROM orders 
+            WHERE status = 'accepted' 
+            ORDER BY accepted_at DESC NULLS LAST, created_at DESC 
+            LIMIT 100
+        """)
         results = cur.fetchall()
         cur.close()
         conn.close()
@@ -829,7 +868,7 @@ async def orders_list_handler(request):
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
 async def new_orders_handler(request):
-    """Yangi buyurtmalarni olish"""
+    """Yangi buyurtmalarni olish - TEKSHIRILAYOTGANLAR"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
