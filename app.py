@@ -62,12 +62,62 @@ def get_cors_headers():
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
         'Access-Control-Max-Age': '86400',
-        'Content-Type': 'application/json'
     }
 
 # ==========================================
-# DATABASE FUNCTIONS
+# DATABASE FUNCTIONS - JADVALLAR YARATISH
 # ==========================================
+
+def init_database():
+    """Jadval yo'q bo'lsa avtomatik yaratish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Orders jadvali
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id SERIAL PRIMARY KEY,
+                order_id VARCHAR(100) UNIQUE NOT NULL,
+                name VARCHAR(255),
+                phone VARCHAR(20),
+                items JSONB,
+                total INTEGER,
+                status VARCHAR(50) DEFAULT 'pending_verification',
+                payment_status VARCHAR(50) DEFAULT 'pending_verification',
+                payment_method VARCHAR(50) DEFAULT 'payme',
+                location VARCHAR(255),
+                tg_id BIGINT,
+                notified BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                accepted_at TIMESTAMP,
+                rejected_at TIMESTAMP,
+                paid_at TIMESTAMP,
+                confirmed_at TIMESTAMP,
+                admin_note TEXT,
+                screenshot TEXT,
+                screenshot_name VARCHAR(255),
+                initiated_from VARCHAR(50) DEFAULT 'webapp'
+            )
+        """)
+        
+        # Index'lar
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
+        
+        conn.commit()
+        cur.close()
+        logger.info("✅ Database initialized successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Database init error: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -275,6 +325,7 @@ Agar to'lov muvaffaqiyatli bo'lgan bo'lsa, "Ha, to'lov qildim" tugmasini bosing 
             pending_confirmations[order_id]['total'] = total
             pending_confirmations[order_id]['items'] = items
             pending_confirmations[order_id]['status'] = 'waiting_confirmation'
+            pending_confirmations[order_id]['name'] = None  # Ism keyinroq olinadi
         
         logger.info(f"✅ Bot tasdiqlash so'rovi yuborildi: {order_id}")
         return True
@@ -283,60 +334,41 @@ Agar to'lov muvaffaqiyatli bo'lgan bo'lsa, "Ha, to'lov qildim" tugmasini bosing 
         logger.error(f"❌ Bot tasdiqlash so'rovi xatosi: {e}")
         return False
 
-async def update_confirmation_message(context: ContextTypes.DEFAULT_TYPE, order_id: str, confirmed: bool):
-    """Tasdiqlash xabarini yangilash (Web App dan tasdiqlanganda)"""
-    with confirmations_lock:
-        data = pending_confirmations.get(order_id, {})
-        tg_id = data.get('tg_id')
-        message_id = data.get('message_id')
-        
-        if not tg_id or not message_id:
-            return
-        
-        # O'chirish
-        if confirmed:
-            try:
-                await context.bot.delete_message(chat_id=tg_id, message_id=message_id)
-                logger.info(f"✅ Bot xabari o'chirildi (Web App dan tasdiqlandi): {order_id}")
-            except Exception as e:
-                logger.error(f"❌ Xabar o'chirish xatosi: {e}")
-            
-            del pending_confirmations[order_id]
-
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback query handler"""
     query = update.callback_query
     await query.answer()
     
     data = query.data
-    user_id = query.from_user.id
+    user = update.effective_user
     
-    # To'lov tasdiqlash (Bot dan)
+    # To'lov tasdiqlash (Bot dan) - ⭐ FAQAT SKRINSHOT SO'RASH, WEB APP'GA O'TMASLIK
     if data.startswith("confirm_payment_"):
         order_id = data.replace("confirm_payment_", "")
         
         # Tekshirish - bu order allaqachon Web App da tasdiqlanganmi
         order = get_order(order_id)
-        if order and order.get('status') == 'confirmed':
+        if order:
             await query.edit_message_text(
                 f"""✅ <b>Allaqachon tasdiqlangan!</b>
 
 🆔 Buyurtma: #{order_id[-6:]}
 
-Web App orqali tasdiqlangan.""",
+Buyurtma qabul qilindi.""",
                 parse_mode='HTML'
             )
             return
         
-        # Web App'ga xabar yuborish uchun data saqlash
+        # ⭐ FAQAT SKRINSHOT SO'RASH - Web App'ga o'tish yo'q!
         with confirmations_lock:
             if order_id not in pending_confirmations:
                 pending_confirmations[order_id] = {}
             pending_confirmations[order_id]['bot_confirmed'] = True
-            pending_confirmations[order_id]['tg_id'] = user_id
-            pending_confirmations[order_id]['status'] = 'bot_confirmed'
+            pending_confirmations[order_id]['tg_id'] = user.id
+            pending_confirmations[order_id]['status'] = 'waiting_screenshot'
+            pending_confirmations[order_id]['name'] = user.first_name or "Foydalanuvchi"
         
-        # Xabarni yangilash - skrinshot so'rash
+        # Xabarni yangilash - faqat skrinshot so'rash
         await query.edit_message_text(
             f"""📸 <b>Skrinshot yuboring</b>
 
@@ -344,18 +376,8 @@ Web App orqali tasdiqlangan.""",
 
 Iltimos, Payme to'lov skrinshotini yuboring.
 
-⏳ Web App ham ochilmoqda...""",
+⏳ Skrinshotni kutib turganda buyurtma saqlanadi...""",
             parse_mode='HTML'
-        )
-        
-        # Web App'ga o'tish uchun link yuborish
-        webapp_link = f"{WEBAPP_URL}?order_id={order_id}&action=upload_screenshot"
-        keyboard = [[InlineKeyboardButton("📱 Web App'da ochish", web_app=WebAppInfo(url=webapp_link))]]
-        
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"👇 Web App'da skrinshot yuklash uchun bosing:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
         return
@@ -434,72 +456,93 @@ Yangi buyurtma uchun /start ni bosing.""",
             await query.edit_message_text("❌ Xatolik yuz berdi!")
 
 async def handle_screenshot_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bot dan skrinshot qabul qilish"""
+    """Bot dan skrinshot qabul qilish - ⭐ AVtomatik order saqlash"""
     user_id = update.effective_user.id
     
     # Qaysi order uchun ekanini topish
     order_id = None
+    pending_data = None
+    
     with confirmations_lock:
         for oid, data in pending_confirmations.items():
-            if data.get('tg_id') == user_id and data.get('status') in ['bot_confirmed', 'waiting_confirmation']:
+            if data.get('tg_id') == user_id and data.get('status') == 'waiting_screenshot':
                 order_id = oid
+                pending_data = data
                 break
     
-    if not order_id:
+    if not order_id or not pending_data:
         # Hech qanday order kutilmayapti
+        await update.message.reply_text(
+            "⚠️ Avval buyurtma yarating. /start ni bosing.",
+            parse_mode='HTML'
+        )
         return
     
-    if update.message.photo:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
+    if not update.message.photo:
+        await update.message.reply_text(
+            "⚠️ Iltimos, rasm (skrinshot) yuboring.",
+            parse_mode='HTML'
+        )
+        return
+    
+    # Skrinshot qabul qilindi
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    
+    photo_bytes = await file.download_as_bytearray()
+    screenshot_base64 = "data:image/jpeg;base64," + base64.b64encode(photo_bytes).decode()
+    
+    # Order ma'lumotlarini olish
+    total = pending_data.get('total', 0)
+    items = pending_data.get('items', [])
+    name = pending_data.get('name') or update.effective_user.first_name or "Foydalanuvchi"
+    
+    # ⭐ ORDERNI AVToMATIK SAQLASH
+    order_data = {
+        'orderId': order_id,
+        'name': name,
+        'phone': '000000000',  # Bot dan telefon olinmadi, default
+        'items': items,
+        'total': total,
+        'status': 'pending_verification',
+        'paymentStatus': 'pending_verification',
+        'paymentMethod': 'payme',
+        'location': None,
+        'tgId': user_id,
+        'notified': False,
+        'screenshot': screenshot_base64,
+        'screenshotName': f"bot_{photo.file_id}.jpg",
+        'initiated_from': 'bot'
+    }
+    
+    # Order saqlash
+    order = create_order(order_data)
+    
+    if order:
+        # Muvaffaqiyatli
+        await update.message.reply_text(
+            f"""✅ <b>Buyurtma qabul qilindi!</b>
+
+🆔 Buyurtma: #{order_id[-6:]}
+💵 Summa: {format_price(total)} so'm
+
+⏳ Admin tekshiruvida...
+Buyurtma holatini "Mening buyurtmalarim" bo'limidan kuzatib borishingiz mumkin.""",
+            parse_mode='HTML'
+        )
         
-        photo_bytes = await file.download_as_bytearray()
-        screenshot_base64 = "data:image/jpeg;base64," + base64.b64encode(photo_bytes).decode()
+        # Admin ga xabar
+        await notify_admin(context, order)
         
-        # Order ma'lumotlarini olish
+        # Tozalash
         with confirmations_lock:
-            data = pending_confirmations.get(order_id, {})
-            total = data.get('total', 0)
-            items = data.get('items', [])
-        
-        # Order yaratish
-        order_data = {
-            'orderId': order_id,
-            'name': update.effective_user.first_name or "Foydalanuvchi",
-            'phone': '000000000',
-            'items': items,
-            'total': total,
-            'status': 'pending_verification',
-            'paymentStatus': 'pending_verification',
-            'paymentMethod': 'payme',
-            'location': None,
-            'tgId': user_id,
-            'notified': False,
-            'screenshot': screenshot_base64,
-            'screenshotName': f"bot_{photo.file_id}.jpg",
-            'initiated_from': 'bot'
-        }
-        
-        # Order saqlash
-        order = create_order(order_data)
-        
-        if order:
-            await update.message.reply_text(
-                "✅ <b>Buyurtma qabul qilindi!</b>\n\n"
-                f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                "⏳ Admin tekshiruvida...",
-                parse_mode='HTML'
-            )
-            
-            # Admin ga xabar
-            await notify_admin(context, order)
-            
-            # Tozalash
-            with confirmations_lock:
-                if order_id in pending_confirmations:
-                    del pending_confirmations[order_id]
-        else:
-            await update.message.reply_text("❌ Xatolik yuz berdi. Qayta urinib ko'ring.")
+            if order_id in pending_confirmations:
+                del pending_confirmations[order_id]
+    else:
+        await update.message.reply_text(
+            "❌ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring yoki /start ni bosing.",
+            parse_mode='HTML'
+        )
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
     """Admin ga xabar yuborish"""
@@ -656,13 +699,23 @@ async def confirm_payment_handler(request):
         
         logger.info(f"✅ Web App dan tasdiqlash: {order_id}")
         
-        # Bot dagi xabarni o'chirish
+        # Bot dagi xabarni o'chirish (agar bor bo'lsa)
         global application
         if application and tg_id:
             try:
-                await update_confirmation_message(application, order_id, confirmed=True)
+                # Xabarni o'chirishga harakat qilish
+                with confirmations_lock:
+                    pending_data = pending_confirmations.get(order_id, {})
+                    message_id = pending_data.get('message_id')
+                    if message_id:
+                        try:
+                            await application.bot.delete_message(chat_id=tg_id, message_id=message_id)
+                        except:
+                            pass
+                    if order_id in pending_confirmations:
+                        del pending_confirmations[order_id]
             except Exception as e:
-                logger.error(f"Xabar yangilash xatosi: {e}")
+                logger.error(f"Xabar o'chirish xatosi: {e}")
         
         return web.json_response({
             "success": True,
@@ -717,14 +770,94 @@ async def check_bot_confirmation_handler(request):
         with confirmations_lock:
             data = pending_confirmations.get(order_id, {})
             bot_confirmed = data.get('bot_confirmed', False)
+            status = data.get('status', '')
         
         return web.json_response({
             "bot_confirmed": bot_confirmed,
+            "status": status,
             "order_id": order_id
         }, headers=get_cors_headers())
         
     except Exception as e:
         logger.error(f"Check bot confirmation error: {e}")
+        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+
+async def orders_list_handler(request):
+    """Barcha buyurtmalarni olish"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 100")
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        orders = []
+        for row in results:
+            order_dict = dict(row)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            orders.append(order_dict)
+        
+        return web.json_response(orders, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"Orders list error: {e}")
+        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+
+async def new_orders_handler(request):
+    """Yangi buyurtmalarni olish"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM orders 
+            WHERE status IN ('pending', 'pending_verification', 'payment_pending') 
+            ORDER BY created_at DESC
+        """)
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        orders = []
+        for row in results:
+            order_dict = dict(row)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            orders.append(order_dict)
+        
+        return web.json_response(orders, headers=get_cors_headers())
+        
+    except Exception as e:
+        logger.error(f"New orders error: {e}")
+        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+
+async def update_order_handler(request):
+    """Buyurtma yangilash"""
+    try:
+        order_id = request.match_info['order_id']
+        data = await request.json()
+        
+        status = data.get('status')
+        payment_status = data.get('paymentStatus')
+        admin_note = data.get('adminNote')
+        
+        updated = update_order_status(
+            order_id, 
+            status, 
+            payment_status=payment_status,
+            admin_note=admin_note
+        )
+        
+        if updated:
+            return web.json_response(updated, headers=get_cors_headers())
+        else:
+            return web.json_response({"error": "Order not found"}, status=404, headers=get_cors_headers())
+            
+    except Exception as e:
+        logger.error(f"Update order error: {e}")
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
 # OPTIONS handler for CORS preflight
@@ -754,6 +887,11 @@ async def init_webhook(app):
     if not TOKEN:
         logger.error("❌ TOKEN o'rnatilmagan!")
         return
+    
+    # ⭐ DATABASE NI INITSIALIZATSIYA QILISH
+    if not init_database():
+        logger.error("❌ Database initialization failed!")
+        # Davom etishga ruxsat beramiz, lekin xatolik log qilinadi
     
     # Webhook URL
     webhook_url = os.getenv("WEBHOOK_URL", "")
@@ -805,15 +943,29 @@ def main():
     # Routes
     app.router.add_get('/', health_handler)
     app.router.add_get('/health', health_handler)
+    
+    # API routes
+    app.router.add_get('/api/orders', orders_list_handler)
+    app.router.add_get('/api/orders/new', new_orders_handler)
     app.router.add_post('/api/orders', create_order_handler)
-    app.router.add_options('/api/orders', options_handler)
     app.router.add_get('/api/orders/{order_id}', get_order_handler)
+    app.router.add_put('/api/orders/{order_id}', update_order_handler)
+    
+    # CORS preflight uchun OPTIONS
+    app.router.add_options('/api/orders', options_handler)
+    app.router.add_options('/api/orders/{order_id}', options_handler)
+    
+    # Confirmation routes
     app.router.add_post('/api/confirm-payment', confirm_payment_handler)
     app.router.add_options('/api/confirm-payment', options_handler)
+    
     app.router.add_post('/api/send-bot-confirmation', send_bot_confirmation_handler)
     app.router.add_options('/api/send-bot-confirmation', options_handler)
+    
     app.router.add_post('/api/check-bot-confirmation', check_bot_confirmation_handler)
     app.router.add_options('/api/check-bot-confirmation', options_handler)
+    
+    # Webhook
     app.router.add_post('/webhook', webhook_handler)
     
     app.on_startup.append(init_webhook)
