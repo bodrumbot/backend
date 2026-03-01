@@ -197,9 +197,14 @@ def get_user_profile(tg_id: int) -> Optional[Dict[str, Any]]:
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        
+        print(f"🔍 SQL: SELECT * FROM users WHERE tg_id = {tg_id} (type: {type(tg_id)})")
+        
         cur.execute("SELECT * FROM users WHERE tg_id = %s", (tg_id,))
         result = cur.fetchone()
         cur.close()
+        
+        print(f"🔍 SQL natija: {result}")
         
         if result:
             return dict(result)
@@ -207,6 +212,8 @@ def get_user_profile(tg_id: int) -> Optional[Dict[str, Any]]:
         
     except Exception as e:
         logger.error(f"❌ Profil olish xatosi: {e}")
+        import traceback
+        traceback.print_exc()
         return None
     finally:
         if conn:
@@ -1061,19 +1068,30 @@ async def get_user_profile_api(request):
     """Foydalanuvchi profilini olish (Telegram ID orqali)"""
     try:
         data = await request.json()
-        tg_id = data.get('tgId')
+        tg_id_raw = data.get('tgId')
         
-        print(f"🔍 API: Profil so'raldi, tg_id: {tg_id}")  # ⭐ LOG
+        print(f"🔍 API: Profil so'raldi, raw tg_id: {tg_id_raw}, type: {type(tg_id_raw)}")
         
-        if not tg_id:
-            return web.json_response({"error": "tgId required"}, status=400, headers=get_cors_headers())
+        if not tg_id_raw:
+            return web.json_response({
+                "success": False, 
+                "error": "tgId required"
+            }, status=400, headers=get_cors_headers())
         
-        tg_id = int(tg_id)
+        # ⭐ TYPE CONVERSION - har qanday formatda kelsa ham ishlaydi
+        try:
+            tg_id = int(tg_id_raw)
+        except (ValueError, TypeError) as e:
+            print(f"❌ tgId conversion error: {e}")
+            return web.json_response({
+                "success": False,
+                "error": "Invalid tgId format"
+            }, status=400, headers=get_cors_headers())
+        
         profile = get_user_profile(tg_id)
         orders = get_user_orders(tg_id)
         
-        print(f"✅ API: Profil: {profile}")  # ⭐ LOG
-        print(f"✅ API: Buyurtmalar soni: {len(orders)}")  # ⭐ LOG
+        print(f"✅ API: Profil: {profile is not None}, Buyurtmalar: {len(orders)}")
         
         return web.json_response({
             "success": True,
@@ -1083,7 +1101,12 @@ async def get_user_profile_api(request):
         
     except Exception as e:
         logger.error(f"Get user profile API error: {e}")
-        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+        import traceback
+        traceback.print_exc()
+        return web.json_response({
+            "success": False,
+            "error": str(e)
+        }, status=500, headers=get_cors_headers())
 
 async def orders_list_handler(request):
     """Barcha buyurtmalarni olish - FAQAT QABUL QILINGANLAR"""
