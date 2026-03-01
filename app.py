@@ -1123,7 +1123,7 @@ async def check_bot_confirmation_handler(request):
         logger.error(f"Check bot confirmation error: {e}")
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
-# ⭐ YANGI API - Foydalanuvchi profili va buyurtmalari
+# get_user_profile_api funksiyasini to'liq almashtiring
 async def get_user_profile_api(request):
     """Foydalanuvchi profilini olish (Telegram ID orqali)"""
     try:
@@ -1149,6 +1149,14 @@ async def get_user_profile_api(request):
             }, status=400, headers=get_cors_headers())
         
         profile = get_user_profile(tg_id)
+        
+        # ⭐ DATETIME FORMATLASH - profil uchun
+        if profile:
+            profile = dict(profile)
+            for key in ['created_at', 'updated_at']:
+                if profile.get(key) and hasattr(profile[key], 'isoformat'):
+                    profile[key] = profile[key].isoformat()
+        
         orders = get_user_orders(tg_id)
         
         print(f"✅ API: Profil: {profile is not None}, Buyurtmalar: {len(orders)}")
