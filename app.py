@@ -154,6 +154,66 @@ def get_db_connection():
 # ==========================================
 # USER PROFILE FUNCTIONS - YANGI!
 # ==========================================
+# ⭐ YANGI: Profil saqlash endpointi
+async def save_user_profile_api(request):
+    """Foydalanuvchi profilini saqlash (Web App dan)"""
+    try:
+        data = await request.json()
+        tg_id_raw = data.get('tgId')
+        name = data.get('name', 'Foydalanuvchi')
+        phone = data.get('phone', '')
+        username = data.get('username', '')
+        
+        print(f"💾 Profil saqlanmoqda: tg_id={tg_id_raw}, name={name}, phone={phone}")
+        
+        if not tg_id_raw:
+            return web.json_response({
+                "success": False,
+                "error": "tgId required"
+            }, status=400, headers=get_cors_headers())
+        
+        try:
+            tg_id = int(tg_id_raw)
+        except (ValueError, TypeError):
+            return web.json_response({
+                "success": False,
+                "error": "Invalid tgId format"
+            }, status=400, headers=get_cors_headers())
+        
+        if not phone or len(phone) != 9:
+            return web.json_response({
+                "success": False,
+                "error": "Valid phone required (9 digits)"
+            }, status=400, headers=get_cors_headers())
+        
+        # Profilni saqlash
+        success = save_user_profile(tg_id, name, phone, username)
+        
+        if success:
+            # Yangilangan profil va buyurtmalarni qaytarish
+            profile = get_user_profile(tg_id)
+            orders = get_user_orders(tg_id)
+            
+            return web.json_response({
+                "success": True,
+                "profile": profile,
+                "orders": orders
+            }, headers=get_cors_headers())
+        else:
+            return web.json_response({
+                "success": False,
+                "error": "Failed to save profile"
+            }, status=500, headers=get_cors_headers())
+            
+    except Exception as e:
+        logger.error(f"Save user profile API error: {e}")
+        import traceback
+        traceback.print_exc()
+        return web.json_response({
+            "success": False,
+            "error": str(e)
+        }, status=500, headers=get_cors_headers())
+
 
 def save_user_profile(tg_id: int, name: str, phone: str, username: str = None) -> bool:
     """Foydalanuvchi profilini saqlash yoki yangilash"""
@@ -1302,6 +1362,10 @@ def main():
     
     app.on_startup.append(init_webhook)
     app.on_cleanup.append(shutdown)
+
+    # Route qo'shish
+    app.router.add_post('/api/user/save-profile', save_user_profile_api)
+    app.router.add_options('/api/user/save-profile', options_handler)
     
     logger.info(f"🚀 Server ishga tushmoqda: 0.0.0.0:{PORT}")
     
