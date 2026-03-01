@@ -1,5 +1,5 @@
 # ==========================================
-# BODRUM BOT - TO'LIQ TO'G'RILANGAN VERSION
+# BODRUM BOT - ADMIN PANEL TUGMASI BILAN
 # ==========================================
 
 import os
@@ -387,6 +387,37 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         if conn:
             conn.close()
 
+def get_new_orders() -> List[Dict[str, Any]]:
+    """Yangi (pending_verification) buyurtmalarni olish"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM orders 
+            WHERE status IN ('pending_verification', 'pending', 'payment_pending')
+            ORDER BY created_at DESC
+        """)
+        results = cur.fetchall()
+        cur.close()
+        
+        orders = []
+        for row in results:
+            order_dict = dict(row)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            orders.append(order_dict)
+        
+        return orders
+        
+    except Exception as e:
+        logger.error(f"❌ Yangi buyurtmalarni olish xatosi: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
 # ==========================================
 # CORS HEADERS
 # ==========================================
@@ -404,19 +435,20 @@ def get_cors_headers():
 # ==========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start handler - profil tekshirish bilan"""
+    """Start handler - Admin uchun yangi buyurtmalar tugmasi bilan"""
     user = update.effective_user
     is_admin = user.id == ADMIN_CHAT_ID_INT
     
-    # Admin uchun
+    # Admin uchun - YANGI BUYURTMALAR tugmasi bilan
     if is_admin:
         keyboard = [
+            [InlineKeyboardButton("🛎️ Yangi buyurtmalar", callback_data="show_new_orders")],
             [InlineKeyboardButton("🍽️ Menyu", web_app=WebAppInfo(url=WEBAPP_URL))],
-            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
+            [InlineKeyboardButton("📊 Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
         ]
         await update.message.reply_text(
             f"👋 Salom, Admin <b>{user.first_name}</b>!\n\n"
-            f"🤖 Bot faol. Yangi buyurtmalar avtomatik keladi.",
+            f"🤖 Bot faol. Yangi buyurtmalar ro'yxatini ko'rish uchun \"🛎️ Yangi buyurtmalar\" tugmasini bosing.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
@@ -431,6 +463,67 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         logger.info(f"❌ Yangi foydalanuvchi: {user.id}")
         await request_phone(update, context)
+
+async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Yangi buyurtmalar ro'yxatini ko'rsatish - Admin uchun"""
+    query = update.callback_query
+    await query.answer()
+    
+    new_orders = get_new_orders()
+    
+    if not new_orders:
+        await query.edit_message_text(
+            "📭 <b>Hozircha yangi buyurtmalar yo'q</b>\n\n"
+            "Barcha buyurtmalar ko'rib chiqilgan.",
+            parse_mode='HTML'
+        )
+        return
+    
+    # Har bir buyurtma uchun alohida xabar
+    for order in new_orders:
+        items = order.get('items', [])
+        if isinstance(items, str):
+            items = json.loads(items)
+        
+        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        
+        has_screenshot = order.get('screenshot') or order.get('screenshot_name')
+        screenshot_indicator = " 📸" if has_screenshot else ""
+        
+        message = f"""🛎️ <b>YANGI BUYURTMA!{screenshot_indicator}</b>
+
+🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
+👤 Mijoz: {order.get('name')}
+📞 Telefon: +998 {order.get('phone')}
+💵 Summa: {format_price(order.get('total', 0))} so'm
+💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅
+
+🍽 Mahsulotlar:
+{items_text}
+
+⏰ {order.get('created_at', datetime.now().isoformat())[:19]}"""
+
+        # ⭐ FAQAT QABUL/RAD TUGMALARI
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
+                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
+            ]
+        ]
+        
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text=message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+    
+    # Asl xabarni yangilash
+    await query.edit_message_text(
+        f"📋 <b>{len(new_orders)} ta yangi buyurtma</b> yuborildi.\n\n"
+        f"Har bir buyurtma uchun alohida xabar yuborildi.",
+        parse_mode='HTML'
+    )
 
 async def request_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telefon raqam so'rash"""
@@ -590,6 +683,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = query.data
     user = update.effective_user
+    
+    # ⭐ YANGI BUYURTMALAR tugmasi
+    if data == "show_new_orders":
+        await show_new_orders_list(update, context)
+        return
     
     # To'lov tasdiqlash
     if data.startswith("confirm_payment_"):
@@ -817,9 +915,9 @@ Buyurtma holatini "Mening buyurtmalarim" bo'limidan kuzatib borishingiz mumkin."
             parse_mode='HTML'
         )
 
-# ⭐⭐⭐ ASOSIY TO'G'RILASH - Admin ga xabar yuborish
+# ⭐⭐⭐ ASOSIY TO'G'RILASH - Admin ga xabar yuborish (FAQAT QABUL/RAD TUGMALARI)
 async def notify_admin(context_or_bot, order: Dict):
-    """Admin ga xabar yuborish"""
+    """Admin ga xabar yuborish - faqat qabul/rad tugmalari bilan"""
     try:
         # context yoki bot obyektini aniqlash
         if hasattr(context_or_bot, 'bot'):
@@ -862,12 +960,12 @@ async def notify_admin(context_or_bot, order: Dict):
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}"""
 
+        # ⭐ FAQAT QABUL/RAD TUGMALARI - Admin panel tugmasi yo'q!
         keyboard = [
             [
                 InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
                 InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
-            ],
-            [InlineKeyboardButton("🌐 Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
+            ]
         ]
         
         # Skrinshot bilan yuborish
@@ -943,7 +1041,6 @@ async def health_handler(request):
         "timestamp": datetime.utcnow().isoformat()
     }, headers=get_cors_headers())
 
-# ⭐⭐⭐ ASOSIY TO'G'RILASH - Buyurtma yaratishda admin ga xabar
 async def create_order_handler(request):
     try:
         data = await request.json()
