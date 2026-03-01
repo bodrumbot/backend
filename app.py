@@ -261,6 +261,19 @@ def get_user_orders(tg_id: int) -> List[Dict[str, Any]]:
 def format_price(price: int) -> str:
     return f"{price:,}".replace(",", " ")
 
+def format_phone_display(phone: str) -> str:
+    """Telefon raqamini ko'rsatish uchun formatlash - bo'sh joysiz"""
+    if not phone:
+        return "Noma'lum"
+    # Faqat raqamlarni olish
+    phone = ''.join(filter(str.isdigit, str(phone)))
+    # 998 ni olib tashlash agar bor bo'lsa
+    if phone.startswith('998'):
+        phone = phone[3:]
+    # 9 ta raqamni olish
+    phone = phone[-9:] if len(phone) > 9 else phone
+    return f"+998{phone}"
+
 def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     conn = None
     try:
@@ -490,11 +503,15 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         has_screenshot = order.get('screenshot') or order.get('screenshot_name')
         screenshot_indicator = " 📸" if has_screenshot else ""
         
+        # ⭐ TELEFON RAQAMINI FORMATLASH - BO'SH JOYSIZ
+        raw_phone = order.get('phone', '')
+        phone_display = format_phone_display(raw_phone)
+        
         message = f"""🛎️ <b>YANGI BUYURTMA!{screenshot_indicator}</b>
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 👤 Mijoz: {order.get('name')}
-📞 Telefon: +998 {order.get('phone')}
+📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
 💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅
 
@@ -794,11 +811,15 @@ Yangi buyurtma uchun /start ni bosing.""",
             has_screenshot = order.get('screenshot') or order.get('screenshot_name')
             screenshot_info = "\n\n📸 Skrinshot: Mavjud" if has_screenshot else ""
             
+            # ⭐ TELEFON RAQAMINI FORMATLASH - BO'SH JOYSIZ
+            raw_phone = order.get('phone', '')
+            phone_display = format_phone_display(raw_phone)
+            
             message = f"""{status_text}
 
 🆔 Buyurtma: #{order_id[-6:]}
 👤 Mijoz: {order.get('name')}
-📞 Telefon: +998 {order.get('phone')}
+📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
 
 🍽 Mahsulotlar:
@@ -914,7 +935,6 @@ Buyurtma holatini "Mening buyurtmalarim" bo'limidan kuzatib borishingiz mumkin."
             "❌ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring yoki /start ni bosing.",
             parse_mode='HTML'
         )
-
 # ⭐⭐⭐ ASOSIY TO'G'RILASH - Admin ga xabar yuborish (FAQAT QABUL/RAD TUGMALARI)
 async def notify_admin(context_or_bot, order: Dict):
     """Admin ga xabar yuborish - faqat qabul/rad tugmalari bilan"""
@@ -947,11 +967,15 @@ async def notify_admin(context_or_bot, order: Dict):
         elif initiated == 'bot':
             source_text = "\n🤖 <b>Bot</b> orqali"
         
+        # ⭐ TELEFON RAQAMINI FORMATLASH - BO'SH JOYSIZ
+        raw_phone = order.get('phone', '')
+        phone_display = format_phone_display(raw_phone)
+        
         message = f"""🛎️ <b>YANGI BUYURTMA!{screenshot_indicator}</b>{source_text}
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 👤 Mijoz: {order.get('name')}
-📞 Telefon: +998 {order.get('phone')}
+📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
 💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅
 
