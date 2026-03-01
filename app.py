@@ -44,8 +44,17 @@ DATABASE_URL = (os.getenv("DATABASE_PUBLIC_URL") or
                 os.getenv("POSTGRES_URL"))
 
 TOKEN = os.getenv("TOKEN")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
+
+# ⭐ MUHIM: ADMIN_CHAT_ID ni int ga o'tkazish
+try:
+    ADMIN_CHAT_ID_INT = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else 0
+except ValueError:
+    logger.error(f"❌ ADMIN_CHAT_ID noto'g'ri formatda: {ADMIN_CHAT_ID}")
+    ADMIN_CHAT_ID_INT = 0
+
+logger.info(f"🔧 ADMIN_CHAT_ID: {ADMIN_CHAT_ID}, parsed: {ADMIN_CHAT_ID_INT}")
 
 # Global application
 application = None
@@ -89,7 +98,7 @@ def init_database():
             )
         """)
         
-        # 2. Users jadvali - YANGI! Foydalanuvchilar uchun alohida jadval
+        # 2. Users jadvali
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -152,68 +161,8 @@ def get_db_connection():
         raise
 
 # ==========================================
-# USER PROFILE FUNCTIONS - YANGI!
+# USER PROFILE FUNCTIONS
 # ==========================================
-# ⭐ YANGI: Profil saqlash endpointi
-async def save_user_profile_api(request):
-    """Foydalanuvchi profilini saqlash (Web App dan)"""
-    try:
-        data = await request.json()
-        tg_id_raw = data.get('tgId')
-        name = data.get('name', 'Foydalanuvchi')
-        phone = data.get('phone', '')
-        username = data.get('username', '')
-        
-        print(f"💾 Profil saqlanmoqda: tg_id={tg_id_raw}, name={name}, phone={phone}")
-        
-        if not tg_id_raw:
-            return web.json_response({
-                "success": False,
-                "error": "tgId required"
-            }, status=400, headers=get_cors_headers())
-        
-        try:
-            tg_id = int(tg_id_raw)
-        except (ValueError, TypeError):
-            return web.json_response({
-                "success": False,
-                "error": "Invalid tgId format"
-            }, status=400, headers=get_cors_headers())
-        
-        if not phone or len(phone) != 9:
-            return web.json_response({
-                "success": False,
-                "error": "Valid phone required (9 digits)"
-            }, status=400, headers=get_cors_headers())
-        
-        # Profilni saqlash
-        success = save_user_profile(tg_id, name, phone, username)
-        
-        if success:
-            # Yangilangan profil va buyurtmalarni qaytarish
-            profile = get_user_profile(tg_id)
-            orders = get_user_orders(tg_id)
-            
-            return web.json_response({
-                "success": True,
-                "profile": profile,
-                "orders": orders
-            }, headers=get_cors_headers())
-        else:
-            return web.json_response({
-                "success": False,
-                "error": "Failed to save profile"
-            }, status=500, headers=get_cors_headers())
-            
-    except Exception as e:
-        logger.error(f"Save user profile API error: {e}")
-        import traceback
-        traceback.print_exc()
-        return web.json_response({
-            "success": False,
-            "error": str(e)
-        }, status=500, headers=get_cors_headers())
-
 
 def save_user_profile(tg_id: int, name: str, phone: str, username: str = None) -> bool:
     """Foydalanuvchi profilini saqlash yoki yangilash"""
@@ -222,7 +171,6 @@ def save_user_profile(tg_id: int, name: str, phone: str, username: str = None) -
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # UPSERT - agar bor bo'lsa yangilash, yo'q bo'lsa yaratish
         cur.execute("""
             INSERT INTO users (tg_id, name, phone, username, updated_at)
             VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
@@ -258,22 +206,21 @@ def get_user_profile(tg_id: int) -> Optional[Dict[str, Any]]:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        print(f"🔍 SQL: SELECT * FROM users WHERE tg_id = {tg_id} (type: {type(tg_id)})")
-        
         cur.execute("SELECT * FROM users WHERE tg_id = %s", (tg_id,))
         result = cur.fetchone()
         cur.close()
         
-        print(f"🔍 SQL natija: {result}")
-        
         if result:
-            return dict(result)
+            profile = dict(result)
+            # ⭐ DATETIME FORMATLASH
+            for key in ['created_at', 'updated_at']:
+                if profile.get(key) and hasattr(profile[key], 'isoformat'):
+                    profile[key] = profile[key].isoformat()
+            return profile
         return None
         
     except Exception as e:
         logger.error(f"❌ Profil olish xatosi: {e}")
-        import traceback
-        traceback.print_exc()
         return None
     finally:
         if conn:
@@ -459,7 +406,7 @@ def get_cors_headers():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start handler - profil tekshirish bilan"""
     user = update.effective_user
-    is_admin = user.id == ADMIN_CHAT_ID
+    is_admin = user.id == ADMIN_CHAT_ID_INT
     
     # Admin uchun
     if is_admin:
@@ -475,15 +422,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # ⭐ ODDIY FOYDALANUVCHI - avval profilni tekshirish
+    # ODDIY FOYDALANUVCHI - avval profilni tekshirish
     profile = get_user_profile(user.id)
     
     if profile and profile.get('phone'):
-        # ✅ Profil mavjud - Web App'ga o'tish
         logger.info(f"✅ Mavjud profil topildi: {user.id}")
         await send_welcome_back(update, context, profile)
     else:
-        # ❌ Profil yo'q - telefon so'rash
         logger.info(f"❌ Yangi foydalanuvchi: {user.id}")
         await request_phone(update, context)
 
@@ -510,7 +455,6 @@ async def send_welcome_back(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     name = profile.get('name', 'Foydalanuvchi')
     phone = profile.get('phone', '')
     
-    # Telefon formatlash
     formatted_phone = phone
     if len(phone) == 9:
         formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}"
@@ -536,21 +480,16 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not contact:
         return
     
-    # Telefon raqamni formatlash
     phone = contact.phone_number
     
-    # + belgisi bilan boshlansa, olib tashlaymiz
     if phone.startswith('+'):
         phone = phone[1:]
     
-    # 998 bilan boshlansa, olib tashlaymiz
     if phone.startswith('998'):
         phone = phone[3:]
     
-    # Faqat 9 ta raqam qoldiriladi
     phone = phone[-9:] if len(phone) > 9 else phone
     
-    # ⭐ DATABASE GA SAQLASH
     success = save_user_profile(
         tg_id=user.id,
         name=user.first_name or "Foydalanuvchi",
@@ -561,14 +500,12 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         logger.info(f"✅ Yangi profil saqlandi: {user.id} - {phone}")
         
-        # Keyboard'ni olib tashlash
         await update.message.reply_text(
             "✅ <b>Ma'lumotlar saqlandi!</b>",
             reply_markup=ReplyKeyboardRemove(),
             parse_mode='HTML'
         )
         
-        # Web App tugmasini yuborish
         await send_webapp_button(update, context, user.id, phone)
     else:
         await update.message.reply_text(
@@ -582,7 +519,6 @@ async def send_webapp_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
     user = update.effective_user
     name = user.first_name or "Foydalanuvchi"
     
-    # Telefon formatlash
     formatted_phone = phone or "---"
     if phone and len(phone) == 9:
         formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}"
@@ -801,7 +737,6 @@ async def handle_screenshot_upload(update: Update, context: ContextTypes.DEFAULT
     """Bot dan skrinshot qabul qilish"""
     user_id = update.effective_user.id
     
-    # Qaysi order uchun ekanini topish
     order_id = None
     pending_data = None
     
@@ -826,23 +761,19 @@ async def handle_screenshot_upload(update: Update, context: ContextTypes.DEFAULT
         )
         return
     
-    # Skrinshot qabul qilindi
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     
     photo_bytes = await file.download_as_bytearray()
     screenshot_base64 = "data:image/jpeg;base64," + base64.b64encode(photo_bytes).decode()
     
-    # Order ma'lumotlarini olish
     total = pending_data.get('total', 0)
     items = pending_data.get('items', [])
     name = pending_data.get('name') or update.effective_user.first_name or "Foydalanuvchi"
     
-    # Telefon raqamni olish (profildan)
     profile = get_user_profile(user_id)
     phone = profile.get('phone', '000000000') if profile else '000000000'
     
-    # ORDERNI SAQLASH
     order_data = {
         'orderId': order_id,
         'name': name,
@@ -874,10 +805,9 @@ Buyurtma holatini "Mening buyurtmalarim" bo'limidan kuzatib borishingiz mumkin."
             parse_mode='HTML'
         )
         
-        # Admin ga xabar
+        # ⭐⭐⭐ ADMIN GA XABAR YUBORISH
         await notify_admin(context, order)
         
-        # Tozalash
         with confirmations_lock:
             if order_id in pending_confirmations:
                 del pending_confirmations[order_id]
@@ -887,9 +817,22 @@ Buyurtma holatini "Mening buyurtmalarim" bo'limidan kuzatib borishingiz mumkin."
             parse_mode='HTML'
         )
 
-async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
+# ⭐⭐⭐ ASOSIY TO'G'RILASH - Admin ga xabar yuborish
+async def notify_admin(context_or_bot, order: Dict):
     """Admin ga xabar yuborish"""
     try:
+        # context yoki bot obyektini aniqlash
+        if hasattr(context_or_bot, 'bot'):
+            bot = context_or_bot.bot
+        else:
+            bot = context_or_bot
+        
+        logger.info(f"🔔 notify_admin chaqirildi, order_id: {order.get('order_id')}, ADMIN_CHAT_ID: {ADMIN_CHAT_ID_INT}")
+        
+        if not ADMIN_CHAT_ID_INT:
+            logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
+            return False
+        
         items = order.get('items', [])
         if isinstance(items, str):
             items = json.loads(items)
@@ -927,41 +870,44 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
             [InlineKeyboardButton("🌐 Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
         ]
         
+        # Skrinshot bilan yuborish
         if has_screenshot and order.get('screenshot'):
             try:
                 screenshot_data = order.get('screenshot')
                 if screenshot_data.startswith('data:image'):
                     image_data = base64.b64decode(screenshot_data.split(',')[1])
                     
-                    await context.bot.send_photo(
-                        chat_id=ADMIN_CHAT_ID,
+                    await bot.send_photo(
+                        chat_id=ADMIN_CHAT_ID_INT,
                         photo=image_data,
                         caption=message,
                         parse_mode='HTML',
                         reply_markup=InlineKeyboardMarkup(keyboard)
                     )
+                    logger.info(f"✅ Admin ga skrinshot bilan xabar yuborildi: {order.get('order_id')}")
                 else:
-                    await context.bot.send_message(
-                        chat_id=ADMIN_CHAT_ID,
+                    await bot.send_message(
+                        chat_id=ADMIN_CHAT_ID_INT,
                         text=message,
                         reply_markup=InlineKeyboardMarkup(keyboard),
                         parse_mode='HTML'
                     )
             except Exception as e:
-                logger.error(f"Skrinshot yuborish xatosi: {e}")
-                await context.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
+                logger.error(f"❌ Skrinshot yuborish xatosi: {e}")
+                await bot.send_message(
+                    chat_id=ADMIN_CHAT_ID_INT,
                     text=message,
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='HTML'
                 )
         else:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
+            await bot.send_message(
+                chat_id=ADMIN_CHAT_ID_INT,
                 text=message,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='HTML'
             )
+            logger.info(f"✅ Admin ga matnli xabar yuborildi: {order.get('order_id')}")
         
         # notified = true
         conn = None
@@ -971,16 +917,20 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: Dict):
             cur.execute("UPDATE orders SET notified = true WHERE order_id = %s", (order.get('order_id'),))
             conn.commit()
             cur.close()
+            logger.info(f"✅ notified=true qilindi: {order.get('order_id')}")
         except Exception as e:
-            logger.error(f"Mark notified error: {e}")
+            logger.error(f"❌ Mark notified error: {e}")
         finally:
             if conn:
                 conn.close()
         
-        logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
+        return True
         
     except Exception as e:
-        logger.error(f"❌ Xabar yuborish xatosi: {e}")
+        logger.error(f"❌ notify_admin xatosi: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 # ==========================================
 # HTTP API HANDLERS
@@ -993,6 +943,7 @@ async def health_handler(request):
         "timestamp": datetime.utcnow().isoformat()
     }, headers=get_cors_headers())
 
+# ⭐⭐⭐ ASOSIY TO'G'RILASH - Buyurtma yaratishda admin ga xabar
 async def create_order_handler(request):
     try:
         data = await request.json()
@@ -1003,13 +954,20 @@ async def create_order_handler(request):
         if order:
             logger.info(f"✅ Buyurtma yaratildi: {order['order_id']}")
             
-            # Telegram bot ga xabar yuborish
+            # ⭐⭐⭐ ADMIN GA XABAR YUBORISH
             global application
-            if application and order.get('tgId'):
+            if application:
                 try:
-                    await notify_admin(application, order)
+                    logger.info(f"🔔 Admin ga xabar yuborilmoqda...")
+                    success = await notify_admin(application, order)
+                    if success:
+                        logger.info(f"✅ Admin ga xabar yuborildi")
+                    else:
+                        logger.warning(f"⚠️ Admin ga xabar yuborilmadi")
                 except Exception as e:
-                    logger.error(f"Admin ga xabar yuborish xatosi: {e}")
+                    logger.error(f"❌ Admin ga xabar yuborish xatosi: {e}")
+            else:
+                logger.warning(f"⚠️ Application mavjud emas, admin ga xabar yuborilmaydi")
             
             return web.json_response(order, status=201, headers=get_cors_headers())
         else:
@@ -1017,6 +975,8 @@ async def create_order_handler(request):
         
     except Exception as e:
         logger.error(f"API create order error: {e}")
+        import traceback
+        traceback.print_exc()
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
 async def get_order_handler(request):
@@ -1123,7 +1083,63 @@ async def check_bot_confirmation_handler(request):
         logger.error(f"Check bot confirmation error: {e}")
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
-# get_user_profile_api funksiyasini to'liq almashtiring
+async def save_user_profile_api(request):
+    """Foydalanuvchi profilini saqlash (Web App dan)"""
+    try:
+        data = await request.json()
+        tg_id_raw = data.get('tgId')
+        name = data.get('name', 'Foydalanuvchi')
+        phone = data.get('phone', '')
+        username = data.get('username', '')
+        
+        print(f"💾 Profil saqlanmoqda: tg_id={tg_id_raw}, name={name}, phone={phone}")
+        
+        if not tg_id_raw:
+            return web.json_response({
+                "success": False,
+                "error": "tgId required"
+            }, status=400, headers=get_cors_headers())
+        
+        try:
+            tg_id = int(tg_id_raw)
+        except (ValueError, TypeError):
+            return web.json_response({
+                "success": False,
+                "error": "Invalid tgId format"
+            }, status=400, headers=get_cors_headers())
+        
+        if not phone or len(phone) != 9:
+            return web.json_response({
+                "success": False,
+                "error": "Valid phone required (9 digits)"
+            }, status=400, headers=get_cors_headers())
+        
+        success = save_user_profile(tg_id, name, phone, username)
+        
+        if success:
+            profile = get_user_profile(tg_id)
+            orders = get_user_orders(tg_id)
+            
+            return web.json_response({
+                "success": True,
+                "profile": profile,
+                "orders": orders
+            }, headers=get_cors_headers())
+        else:
+            return web.json_response({
+                "success": False,
+                "error": "Failed to save profile"
+            }, status=500, headers=get_cors_headers())
+            
+    except Exception as e:
+        logger.error(f"Save user profile API error: {e}")
+        import traceback
+        traceback.print_exc()
+        return web.json_response({
+            "success": False,
+            "error": str(e)
+        }, status=500, headers=get_cors_headers())
+
 async def get_user_profile_api(request):
     """Foydalanuvchi profilini olish (Telegram ID orqali)"""
     try:
@@ -1138,7 +1154,6 @@ async def get_user_profile_api(request):
                 "error": "tgId required"
             }, status=400, headers=get_cors_headers())
         
-        # ⭐ TYPE CONVERSION - har qanday formatda kelsa ham ishlaydi
         try:
             tg_id = int(tg_id_raw)
         except (ValueError, TypeError) as e:
@@ -1149,14 +1164,6 @@ async def get_user_profile_api(request):
             }, status=400, headers=get_cors_headers())
         
         profile = get_user_profile(tg_id)
-        
-        # ⭐ DATETIME FORMATLASH - profil uchun
-        if profile:
-            profile = dict(profile)
-            for key in ['created_at', 'updated_at']:
-                if profile.get(key) and hasattr(profile[key], 'isoformat'):
-                    profile[key] = profile[key].isoformat()
-        
         orders = get_user_orders(tg_id)
         
         print(f"✅ API: Profil: {profile is not None}, Buyurtmalar: {len(orders)}")
@@ -1315,7 +1322,7 @@ async def init_webhook(app):
         except Exception as e:
             logger.error(f"❌ Webhook xato: {e}")
     
-    logger.info("🤖 Bot ishga tushdi!")
+    logger.info(f"🤖 Bot ishga tushdi! ADMIN_CHAT_ID: {ADMIN_CHAT_ID_INT}")
 
 async def shutdown(app):
     global application
@@ -1351,7 +1358,7 @@ def main():
     app.router.add_options('/api/orders', options_handler)
     app.router.add_options('/api/orders/{order_id}', options_handler)
     
-    # ⭐ YANGI ROUTE - User profile API
+    # User profile API
     app.router.add_post('/api/user/profile', get_user_profile_api)
     app.router.add_options('/api/user/profile', options_handler)
     
