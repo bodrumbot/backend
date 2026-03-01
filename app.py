@@ -1,5 +1,5 @@
 # ==========================================
-# BODRUM BOT - TO'G'RILANGAN VERSION
+# BODRUM BOT - TO'LIQ TO'G'RILANGAN VERSION
 # ==========================================
 
 import os
@@ -1063,12 +1063,17 @@ async def get_user_profile_api(request):
         data = await request.json()
         tg_id = data.get('tgId')
         
+        print(f"🔍 API: Profil so'raldi, tg_id: {tg_id}")  # ⭐ LOG
+        
         if not tg_id:
             return web.json_response({"error": "tgId required"}, status=400, headers=get_cors_headers())
         
         tg_id = int(tg_id)
         profile = get_user_profile(tg_id)
         orders = get_user_orders(tg_id)
+        
+        print(f"✅ API: Profil: {profile}")  # ⭐ LOG
+        print(f"✅ API: Buyurtmalar soni: {len(orders)}")  # ⭐ LOG
         
         return web.json_response({
             "success": True,
