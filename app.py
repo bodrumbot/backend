@@ -467,7 +467,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # ODDIY FOYDALANUVCHI - avval profilni tekshirish
+    # ODDIY FOYDALANUVCHI - avval profilini tekshirish
     profile = get_user_profile(user.id)
     
     if profile and profile.get('phone'):
@@ -507,13 +507,27 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         raw_phone = order.get('phone', '')
         phone_display = format_phone_display(raw_phone)
         
+        # ⭐ JOYLASHUVNI TEKSHIRISH
+        location = order.get('location')
+        location_text = ""
+        location_coords = None
+        if location and ',' in str(location):
+            try:
+                lat, lng = str(location).split(',')
+                lat = float(lat.strip())
+                lng = float(lng.strip())
+                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+                location_coords = (lat, lng)
+            except:
+                pass
+        
         message = f"""🛎️ <b>YANGI BUYURTMA!{screenshot_indicator}</b>
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 👤 Mijoz: {order.get('name')}
 📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅
+💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅{location_text}
 
 🍽 Mahsulotlar:
 {items_text}
@@ -528,12 +542,25 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
             ]
         ]
         
-        await context.bot.send_message(
+        sent_message = await context.bot.send_message(
             chat_id=update.effective_user.id,
             text=message,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
+        
+        # ⭐⭐⭐ JOYLASHUVNI ALohida xabar sifatida yuborish
+        if location_coords:
+            try:
+                await context.bot.send_location(
+                    chat_id=update.effective_user.id,
+                    latitude=location_coords[0],
+                    longitude=location_coords[1],
+                    reply_to_message_id=sent_message.message_id
+                )
+                logger.info(f"✅ Joylashuv yuborildi (show_new_orders): {location_coords}")
+            except Exception as e:
+                logger.error(f"❌ Joylashuv yuborish xatosi (show_new_orders): {e}")
     
     # Asl xabarni yangilash
     await query.edit_message_text(
@@ -935,6 +962,7 @@ Buyurtma holatini "Mening buyurtmalarim" bo'limidan kuzatib borishingiz mumkin."
             "❌ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring yoki /start ni bosing.",
             parse_mode='HTML'
         )
+
 # ⭐⭐⭐ ASOSIY TO'G'RILASH - Admin ga xabar yuborish (FAQAT QABUL/RAD TUGMALARI)
 async def notify_admin(context_or_bot, order: Dict):
     """Admin ga xabar yuborish - faqat qabul/rad tugmalari bilan"""
@@ -971,13 +999,25 @@ async def notify_admin(context_or_bot, order: Dict):
         raw_phone = order.get('phone', '')
         phone_display = format_phone_display(raw_phone)
         
+        # ⭐ JOYLASHUVNI TEKSHIRISH
+        location = order.get('location')
+        location_text = ""
+        if location and ',' in str(location):
+            try:
+                lat, lng = str(location).split(',')
+                lat = float(lat.strip())
+                lng = float(lng.strip())
+                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+            except:
+                pass
+        
         message = f"""🛎️ <b>YANGI BUYURTMA!{screenshot_indicator}</b>{source_text}
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 👤 Mijoz: {order.get('name')}
 📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅
+💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅{location_text}
 
 🍽 Mahsulotlar:
 {items_text}
@@ -992,6 +1032,8 @@ async def notify_admin(context_or_bot, order: Dict):
             ]
         ]
         
+        sent_message = None
+        
         # Skrinshot bilan yuborish
         if has_screenshot and order.get('screenshot'):
             try:
@@ -999,7 +1041,7 @@ async def notify_admin(context_or_bot, order: Dict):
                 if screenshot_data.startswith('data:image'):
                     image_data = base64.b64decode(screenshot_data.split(',')[1])
                     
-                    await bot.send_photo(
+                    sent_message = await bot.send_photo(
                         chat_id=ADMIN_CHAT_ID_INT,
                         photo=image_data,
                         caption=message,
@@ -1008,7 +1050,7 @@ async def notify_admin(context_or_bot, order: Dict):
                     )
                     logger.info(f"✅ Admin ga skrinshot bilan xabar yuborildi: {order.get('order_id')}")
                 else:
-                    await bot.send_message(
+                    sent_message = await bot.send_message(
                         chat_id=ADMIN_CHAT_ID_INT,
                         text=message,
                         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1016,20 +1058,38 @@ async def notify_admin(context_or_bot, order: Dict):
                     )
             except Exception as e:
                 logger.error(f"❌ Skrinshot yuborish xatosi: {e}")
-                await bot.send_message(
+                sent_message = await bot.send_message(
                     chat_id=ADMIN_CHAT_ID_INT,
                     text=message,
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='HTML'
                 )
         else:
-            await bot.send_message(
+            sent_message = await bot.send_message(
                 chat_id=ADMIN_CHAT_ID_INT,
                 text=message,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='HTML'
             )
             logger.info(f"✅ Admin ga matnli xabar yuborildi: {order.get('order_id')}")
+        
+        # ⭐⭐⭐ JOYLASHUVNI ALohida xabar sifatida yuborish
+        if location and ',' in str(location):
+            try:
+                lat, lng = str(location).split(',')
+                lat = float(lat.strip())
+                lng = float(lng.strip())
+                
+                # Joylashuvni alohida yuborish (reply qilib)
+                await bot.send_location(
+                    chat_id=ADMIN_CHAT_ID_INT,
+                    latitude=lat,
+                    longitude=lng,
+                    reply_to_message_id=sent_message.message_id if sent_message else None
+                )
+                logger.info(f"✅ Joylashuv yuborildi: {lat}, {lng}")
+            except Exception as e:
+                logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
         
         # notified = true
         conn = None
