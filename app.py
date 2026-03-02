@@ -503,7 +503,7 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         has_screenshot = order.get('screenshot') or order.get('screenshot_name')
         screenshot_indicator = " 📸" if has_screenshot else ""
         
-        # ⭐ TELEFON RAQAMINI FORMATLASH - BO'SH JOYSIZ
+        # TELEFON RAQAMINI FORMATLASH
         raw_phone = order.get('phone', '')
         phone_display = format_phone_display(raw_phone)
         
@@ -534,7 +534,6 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
 
 ⏰ {order.get('created_at', datetime.now().isoformat())[:19]}"""
 
-        # ⭐ FAQAT QABUL/RAD TUGMALARI
         keyboard = [
             [
                 InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
@@ -549,7 +548,7 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode='HTML'
         )
         
-        # ⭐⭐⭐ JOYLASHUVNI ALohida xabar sifatida yuborish
+        # ⭐ JOYLASHUVNI ALohida xabar sifatida yuborish
         if location_coords:
             try:
                 await context.bot.send_location(
@@ -965,7 +964,7 @@ Buyurtma holatini "Mening buyurtmalarim" bo'limidan kuzatib borishingiz mumkin."
 
 # ⭐⭐⭐ ASOSIY TO'G'RILASH - Admin ga xabar yuborish (FAQAT QABUL/RAD TUGMALARI)
 async def notify_admin(context_or_bot, order: Dict):
-    """Admin ga xabar yuborish - faqat qabul/rad tugmalari bilan"""
+    """Admin ga xabar yuborish - joylashuv bilan"""
     try:
         # context yoki bot obyektini aniqlash
         if hasattr(context_or_bot, 'bot'):
@@ -995,21 +994,27 @@ async def notify_admin(context_or_bot, order: Dict):
         elif initiated == 'bot':
             source_text = "\n🤖 <b>Bot</b> orqali"
         
-        # ⭐ TELEFON RAQAMINI FORMATLASH - BO'SH JOYSIZ
+        # ⭐ TELEFON RAQAMINI FORMATLASH
         raw_phone = order.get('phone', '')
         phone_display = format_phone_display(raw_phone)
         
-        # ⭐ JOYLASHUVNI TEKSHIRISH
+        # ⭐⭐⭐ JOYLASHUVNI TEKSHIRISH VA YUBORISH
         location = order.get('location')
         location_text = ""
+        location_coords = None
+        
         if location and ',' in str(location):
             try:
                 lat, lng = str(location).split(',')
                 lat = float(lat.strip())
                 lng = float(lng.strip())
                 location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
-            except:
-                pass
+                location_coords = (lat, lng)
+            except Exception as e:
+                logger.warning(f"Joylashuv parse xatosi: {e}")
+                location_text = f"\n📍 <b>Manzil:</b> {location}"
+        elif location:
+            location_text = f"\n📍 <b>Manzil:</b> {location}"
         
         message = f"""🛎️ <b>YANGI BUYURTMA!{screenshot_indicator}</b>{source_text}
 
@@ -1024,7 +1029,7 @@ async def notify_admin(context_or_bot, order: Dict):
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}"""
 
-        # ⭐ FAQAT QABUL/RAD TUGMALARI - Admin panel tugmasi yo'q!
+        # FAQAT QABUL/RAD TUGMALARI
         keyboard = [
             [
                 InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
@@ -1073,21 +1078,16 @@ async def notify_admin(context_or_bot, order: Dict):
             )
             logger.info(f"✅ Admin ga matnli xabar yuborildi: {order.get('order_id')}")
         
-        # ⭐⭐⭐ JOYLASHUVNI ALohida xabar sifatida yuborish
-        if location and ',' in str(location):
+        # ⭐⭐⭐ JOYLASHUVNI ALohida LOCATION xabar sifatida yuborish
+        if location_coords:
             try:
-                lat, lng = str(location).split(',')
-                lat = float(lat.strip())
-                lng = float(lng.strip())
-                
-                # Joylashuvni alohida yuborish (reply qilib)
                 await bot.send_location(
                     chat_id=ADMIN_CHAT_ID_INT,
-                    latitude=lat,
-                    longitude=lng,
+                    latitude=location_coords[0],
+                    longitude=location_coords[1],
                     reply_to_message_id=sent_message.message_id if sent_message else None
                 )
-                logger.info(f"✅ Joylashuv yuborildi: {lat}, {lng}")
+                logger.info(f"✅ Joylashuv yuborildi: {location_coords}")
             except Exception as e:
                 logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
         
@@ -1113,7 +1113,6 @@ async def notify_admin(context_or_bot, order: Dict):
         import traceback
         traceback.print_exc()
         return False
-
 # ==========================================
 # HTTP API HANDLERS
 # ==========================================
