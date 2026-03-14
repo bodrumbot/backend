@@ -11,6 +11,7 @@ import psycopg2
 import psycopg2.extras
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+import requests
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -95,7 +96,8 @@ def init_database():
                 admin_note TEXT,
                 transaction_id VARCHAR(100),
                 auto_accepted BOOLEAN DEFAULT FALSE,
-                initiated_from VARCHAR(50) DEFAULT 'webapp'
+                initiated_from VARCHAR(50) DEFAULT 'website',
+                source VARCHAR(50) DEFAULT 'website'
             )
         """)
         
@@ -139,6 +141,54 @@ def get_db_connection():
     except Exception as e:
         logger.error(f"Database connection error: {e}")
         raise
+
+# ==========================================
+# TELEGRAM BOT API DIRECT FUNCTIONS
+# ==========================================
+
+def send_telegram_message(chat_id: int, text: str, parse_mode: str = 'HTML') -> bool:
+    """Direct API call to send message"""
+    if not TOKEN:
+        logger.error("❌ TOKEN not set")
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        payload = {
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': parse_mode
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        result = response.json()
+        
+        if result.get('ok'):
+            logger.info(f"✅ Message sent to {chat_id}")
+            return True
+        else:
+            logger.error(f"❌ Telegram API error: {result}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ send_telegram_message error: {e}")
+        return False
+
+def send_telegram_location(chat_id: int, latitude: float, longitude: float) -> bool:
+    """Direct API call to send location"""
+    if not TOKEN:
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendLocation"
+        payload = {
+            'chat_id': chat_id,
+            'latitude': latitude,
+            'longitude': longitude
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        return response.json().get('ok', False)
+    except Exception as e:
+        logger.error(f"❌ send_telegram_location error: {e}")
+        return False
 
 # ==========================================
 # USER PROFILE FUNCTIONS
@@ -293,21 +343,25 @@ def create_order(data: Dict) -> Optional[Dict]:
             except:
                 tg_id = None
         
+        # Source aniqlash (website yoki webapp)
+        source = data.get('source', 'website')
+        initiated_from = data.get('initiated_from', 'website')
+        
         cur.execute("""
             INSERT INTO orders (
                 order_id, name, phone, items, total, 
                 status, payment_status, payment_method, 
                 location, tg_id, notified, created_at,
-                initiated_from
+                initiated_from, source
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
             data.get('orderId'), data.get('name'), data.get('phone'),
             items_json, data.get('total'), data.get('status', 'pending_payment'),
             data.get('paymentStatus', 'pending'), data.get('paymentMethod', 'payme'),
             data.get('location'), tg_id, False, datetime.utcnow(),
-            data.get('initiated_from', 'webapp')
+            initiated_from, source
         ))
         
         result = cur.fetchone()
@@ -451,9 +505,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         
         await update.message.reply_text(
-            f"👋 Salom, <b>{name}</b>!\n\n"
-            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
-            f"📞 Telefon: +998 {formatted_phone}\n\n"
+            f"👋 Salom, <b>{name}</b>!\\n\\n"
+            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\\n\\n"
+            f"📞 Telefon: +998 {formatted_phone}\\n\\n"
             f"🛒 Menyudan buyurtma berishingiz mumkin:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
@@ -468,8 +522,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         await update.message.reply_text(
-            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
-            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
+            f"👋 Salom, <b>{user.first_name}</b>!\\n\\n"
+            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\\n\\n"
             f"📱 Buyurtma berish uchun telefon raqamingizni yuboring:",
             reply_markup=keyboard,
             parse_mode='HTML'
@@ -510,7 +564,7 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if not new_orders:
         await query.edit_message_text(
-            "📭 <b>Hozircha yangi buyurtmalar yo'q</b>\n\n"
+            "📭 <b>Hozircha yangi buyurtmalar yo'q</b>\\n\\n"
             "Barcha buyurtmalar ko'rib chiqilgan.",
             parse_mode='HTML'
         )
@@ -522,7 +576,7 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         if isinstance(items, str):
             items = json.loads(items)
         
-        items_text = "\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        items_text = "\\\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
         
         # TELEFON RAQAMINI FORMATLASH
         raw_phone = order.get('phone', '')
@@ -537,10 +591,14 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
                 lat, lng = str(location).split(',')
                 lat = float(lat.strip())
                 lng = float(lng.strip())
-                location_text = f"\\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+                location_text = f"\\\\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
                 location_coords = (lat, lng)
             except:
                 pass
+        
+        # Source tekshirish
+        source = order.get('source', 'website')
+        source_text = "🌐 Sayt" if source == 'website' else "🤖 WebApp"
         
         message = f"""🛎️ <b>YANGI BUYURTMA!</b>
 
@@ -548,7 +606,8 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
 👤 Mijoz: {order.get('name')}
 📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: {order.get('payment_method', 'N/A').upper()} ⏳{location_text}
+💳 To'lov: {order.get('payment_method', 'N/A').upper()} ⏳
+📱 Manba: {source_text}{location_text}
 
 🍽 Mahsulotlar:
 {items_text}
@@ -691,7 +750,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if isinstance(items, str):
                 items = json.loads(items)
             
-            items_text = "\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+            items_text = "\\\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
             
             raw_phone = order.get('phone', '')
             phone_display = format_phone_display(raw_phone)
@@ -892,16 +951,11 @@ async def show_user_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, o
             parse_mode='HTML'
         )
 
-# ⭐ AVTOMATIK QABUL QILISH - Admin ga xabar
-async def notify_admin_auto_accepted(context_or_bot, order: Dict):
-    """Admin ga avtomatik qabul qilingan buyurtma haqida xabar"""
+# ⭐ AVTOMATIK QABUL QILISH va XABAR YUBORISH
+async def notify_admin_and_customer(order: Dict, is_webapp: bool = False):
+    """Admin va mijozga avtomatik xabar yuborish"""
     try:
-        if hasattr(context_or_bot, 'bot'):
-            bot = context_or_bot.bot
-        else:
-            bot = context_or_bot
-        
-        logger.info(f"🔔 notify_admin_auto_accepted chaqirildi, order_id: {order.get('order_id')}")
+        logger.info(f"🔔 notify_admin_and_customer chaqirildi, order_id: {order.get('order_id')}, is_webapp: {is_webapp}")
         
         if not ADMIN_CHAT_ID_INT:
             logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
@@ -927,7 +981,7 @@ async def notify_admin_auto_accepted(context_or_bot, order: Dict):
                 lat, lng = str(location).split(',')
                 lat = float(lat.strip())
                 lng = float(lng.strip())
-                location_text = f"\\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko\\'rish</a>"
+                location_text = f"\\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
                 location_coords = (lat, lng)
             except Exception as e:
                 logger.warning(f"Joylashuv parse xatosi: {e}")
@@ -935,99 +989,59 @@ async def notify_admin_auto_accepted(context_or_bot, order: Dict):
         elif location:
             location_text = f"\\n📍 <b>Manzil:</b> {location}"
         
-        message = f"""⚡ <b>AVTOMATIK QABUL QILINDI!</b>
+        # Source
+        source = order.get('source', 'website')
+        source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
+        
+        # 1. ADMINGA XABAR
+        admin_message = f"""⚡ <b>YANGI BUYURTMA (Avtomatik)!</b>
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 👤 Mijoz: {order.get('name')}
 📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: PAYME ✅ (Avtomatik){location_text}
+💳 To'lov: PAYME ✅
+📱 Manba: {source_icon}{location_text}
 
 🍽 Mahsulotlar:
 {items_text}
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}
 
-<i>✅ To'lov muvaffaqiyatli - buyurtma avtomatik qabul qilindi</i>"""
+<i>✅ To'lov muvaffaqiyatli - yangi buyurtma</i>"""
 
-        # Tugmasiz xabar (chunki allaqachon qabul qilingan)
-        sent_message = await bot.send_message(
-            chat_id=ADMIN_CHAT_ID_INT,
-            text=message,
-            parse_mode='HTML'
-        )
+        # Admin ga xabar yuborish (direct API)
+        admin_sent = send_telegram_message(ADMIN_CHAT_ID_INT, admin_message)
         
         # Joylashuvni alohida yuborish
-        if location_coords:
-            try:
-                await bot.send_location(
-                    chat_id=ADMIN_CHAT_ID_INT,
-                    latitude=location_coords[0],
-                    longitude=location_coords[1],
-                    reply_to_message_id=sent_message.message_id
-                )
-                logger.info(f"✅ Joylashuv yuborildi: {location_coords}")
-            except Exception as e:
-                logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
+        if location_coords and admin_sent:
+            send_telegram_location(ADMIN_CHAT_ID_INT, location_coords[0], location_coords[1])
         
-        # notified = true
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("UPDATE orders SET notified = true WHERE order_id = %s", (order.get('order_id'),))
-            conn.commit()
-            cur.close()
-            logger.info(f"✅ notified=true qilindi: {order.get('order_id')}")
-        except Exception as e:
-            logger.error(f"❌ Mark notified error: {e}")
-        finally:
-            if conn:
-                conn.close()
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ notify_admin_auto_accepted xatosi: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        # 2. MIJOZGA XABAR (faqat WebApp dan kirgan bo'lsa)
+        if is_webapp:
+            tg_id = order.get('tg_id')
+            if tg_id:
+                customer_message = f"""✅ <b>Buyurtmangiz qabul qilindi!</b>
 
-# ⭐ MIJOZGA AVTOMATIK XABAR YUBORISH
-async def notify_customer_auto_accepted(bot, order: Dict):
-    """Mijozga avtomatik qabul qilingan xabar yuborish"""
-    try:
-        tg_id = order.get('tg_id')
-        if not tg_id:
-            logger.warning("⚠️ Mijoz tg_id topilmadi")
-            return False
-        
-        order_id = order.get('order_id', 'N/A')
-        total = order.get('total', 0)
-        
-        message = f"""✅ <b>Buyurtmangiz qabul qilindi!</b>
-
-🆔 Buyurtma: #{order_id[-6:]}
-💵 Summa: {format_price(total)} so'm
+🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
+💵 Summa: {format_price(order.get('total', 0))} so'm
 💳 To'lov: Payme ✅
 
-Buyurtmangiz muvaffaqiyatli to'landi va avtomatik qabul qilindi!
+Buyurtmangiz muvaffaqiyatli to'landi va qabul qilindi!
 
 Tez orada yetkazib beramiz! 🚀
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}"""
+                
+                send_telegram_message(int(tg_id), customer_message)
+                logger.info(f"✅ Mijozga xabar yuborildi: {tg_id}")
         
-        await bot.send_message(
-            chat_id=tg_id,
-            text=message,
-            parse_mode='HTML'
-        )
-        
-        logger.info(f"✅ Mijozga xabar yuborildi: {tg_id}")
         return True
         
     except Exception as e:
-        logger.error(f"❌ Mijozga xabar yuborish xatosi: {e}")
+        logger.error(f"❌ notify_admin_and_customer xatosi: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # ==========================================
@@ -1045,6 +1059,12 @@ async def create_order_handler(request):
     try:
         data = await request.json()
         logger.info(f"📝 Yangi buyurtma: {data.get('orderId')}")
+        
+        # ⭐ AGAR profil ma'lumotlari bo'lmasa, default qiymatlar ishlatish
+        if not data.get('name'):
+            data['name'] = 'Mijoz'
+        if not data.get('phone'):
+            data['phone'] = '000000000'
         
         order = create_order(data)
         
@@ -1073,9 +1093,9 @@ async def get_order_handler(request):
         logger.error(f"API get order error: {e}")
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
-# ⭐ PAYME CALLBACK - AVTOMATIK QABUL QILISH
+# ⭐ PAYME CALLBACK - AVTOMATIK QABUL QILISH va XABAR YUBORISH
 async def payme_callback_handler(request):
-    """Payme dan to'lov xabari kelganda avtomatik qabul qilish"""
+    """Payme dan to'lov xabari kelganda avtomatik qabul qilish va xabar yuborish"""
     try:
         data = await request.json()
         logger.info(f"💰 Payme callback: {data}")
@@ -1087,21 +1107,21 @@ async def payme_callback_handler(request):
         if not order_id:
             return web.json_response({"error": "order_id required"}, status=400, headers=get_cors_headers())
         
+        # Buyurtma ma'lumotlarini olish
+        order = get_order(order_id)
+        if not order:
+            return web.json_response({"error": "Order not found"}, status=404, headers=get_cors_headers())
+        
+        # Source ni aniqlash (webapp yoki website)
+        source = order.get('source', 'website')
+        is_webapp = source == 'webapp' or order.get('initiated_from') == 'webapp'
+        
         if status == 'success' or status == 'completed':
             # Buyurtmani avtomatik qabul qilish
             conn = None
             try:
                 conn = get_db_connection()
                 cur = conn.cursor()
-                
-                # Avval buyurtma ma'lumotlarini olish
-                cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
-                order = cur.fetchone()
-                
-                if not order:
-                    return web.json_response({"error": "Order not found"}, status=404, headers=get_cors_headers())
-                
-                order_dict = dict(order)
                 
                 # ⭐ AVTOMATIK QABUL QILISH
                 cur.execute("""
@@ -1128,12 +1148,8 @@ async def payme_callback_handler(request):
                     
                     logger.info(f"✅ Buyurtma avtomatik qabul qilindi: {order_id}")
                     
-                    # Admin ga xabar yuborish
-                    global application
-                    if application:
-                        await notify_admin_auto_accepted(application, updated_dict)
-                        # Mijozga ham xabar yuborish
-                        await notify_customer_auto_accepted(application.bot, updated_dict)
+                    # ⭐ ADMINGA VA MIJOZGA XABAR YUBORISH
+                    await notify_admin_and_customer(updated_dict, is_webapp)
                     
                     return web.json_response({
                         "success": True,
