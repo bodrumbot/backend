@@ -1,6 +1,7 @@
 # ==========================================
 # BODRUM BOT - AVTOMATIK TO'LOV TIZIMI
-# Skrinshot olib tashandi, Payme callback bilan auto-accept
+# Payme callback bilan auto-accept
+# Sayt va WebApp uchun universal
 # ==========================================
 
 import os
@@ -93,7 +94,8 @@ def init_database():
                 confirmed_at TIMESTAMP,
                 admin_note TEXT,
                 transaction_id VARCHAR(100),
-                auto_accepted BOOLEAN DEFAULT FALSE
+                auto_accepted BOOLEAN DEFAULT FALSE,
+                initiated_from VARCHAR(50) DEFAULT 'webapp'
             )
         """)
         
@@ -283,6 +285,14 @@ def create_order(data: Dict) -> Optional[Dict]:
         else:
             items_json = items
         
+        # ⭐ tg_id ni to'g'ri formatlash
+        tg_id = data.get('tgId') or data.get('tg_id')
+        if tg_id:
+            try:
+                tg_id = int(tg_id)
+            except:
+                tg_id = None
+        
         cur.execute("""
             INSERT INTO orders (
                 order_id, name, phone, items, total, 
@@ -296,7 +306,7 @@ def create_order(data: Dict) -> Optional[Dict]:
             data.get('orderId'), data.get('name'), data.get('phone'),
             items_json, data.get('total'), data.get('status', 'pending_payment'),
             data.get('paymentStatus', 'pending'), data.get('paymentMethod', 'payme'),
-            data.get('location'), data.get('tgId'), False, datetime.utcnow(),
+            data.get('location'), tg_id, False, datetime.utcnow(),
             data.get('initiated_from', 'webapp')
         ))
         
@@ -314,6 +324,8 @@ def create_order(data: Dict) -> Optional[Dict]:
         
     except Exception as e:
         logger.error(f"Create order error: {e}")
+        import traceback
+        traceback.print_exc()
         if conn:
             conn.rollback()
         return None
@@ -510,7 +522,7 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         if isinstance(items, str):
             items = json.loads(items)
         
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        items_text = "\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
         
         # TELEFON RAQAMINI FORMATLASH
         raw_phone = order.get('phone', '')
@@ -525,7 +537,7 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
                 lat, lng = str(location).split(',')
                 lat = float(lat.strip())
                 lng = float(lng.strip())
-                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+                location_text = f"\\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
                 location_coords = (lat, lng)
             except:
                 pass
@@ -572,7 +584,7 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Asl xabarni yangilash
     await query.edit_message_text(
-        f"📋 <b>{len(new_orders)} ta yangi buyurtma</b> yuborildi.\n\n"
+        f"📋 <b>{len(new_orders)} ta yangi buyurtma</b> yuborildi.\\n\\n"
         f"Har bir buyurtma uchun alohida xabar yuborildi.",
         parse_mode='HTML'
     )
@@ -619,9 +631,9 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}"
         
         await update.message.reply_text(
-            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
-            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\n\n"
-            f"📞 Telefon: +998 {formatted_phone}\n\n"
+            f"👋 Salom, <b>{user.first_name}</b>!\\n\\n"
+            f"🍽️ <b>BODRUM</b> restoraniga xush kelibsiz!\\n\\n"
+            f"📞 Telefon: +998 {formatted_phone}\\n\\n"
             f"🛒 Menyudan buyurtma berishingiz mumkin:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
@@ -679,7 +691,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if isinstance(items, str):
                 items = json.loads(items)
             
-            items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+            items_text = "\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
             
             raw_phone = order.get('phone', '')
             phone_display = format_phone_display(raw_phone)
@@ -707,9 +719,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if tg_id:
                 try:
                     if action == 'accept':
-                        msg = f"✅ Buyurtmangiz #{order_id[-6:]} qabul qilindi!\n\nTez orada yetkazib beramiz! 🚀"
+                        msg = f"✅ Buyurtmangiz #{order_id[-6:]} qabul qilindi!\\n\\nTez orada yetkazib beramiz! 🚀"
                     else:
-                        msg = f"❌ Buyurtmangiz #{order_id[-6:]} bekor qilindi.\n\nQo'llab-quvvatlash: +998901234567"
+                        msg = f"❌ Buyurtmangiz #{order_id[-6:]} bekor qilindi.\\n\\nQo'llab-quvvatlash: +998901234567"
                     
                     await context.bot.send_message(chat_id=tg_id, text=msg)
                 except Exception as e:
@@ -809,7 +821,7 @@ async def myorders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not orders:
         await update.message.reply_text(
-            "📭 <b>Sizda hali buyurtmalar yo'q</b>\n\n"
+            "📭 <b>Sizda hali buyurtmalar yo'q</b>\\n\\n"
             "🍽️ Menyudan buyurtma berish uchun /start ni bosing",
             parse_mode='HTML'
         )
@@ -834,7 +846,7 @@ async def show_user_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, o
     
     recent_orders = orders[:5]
     
-    orders_text = "📋 <b>SIZNING BUYURTMALARINGIZ</b>\n\n"
+    orders_text = "📋 <b>SIZNING BUYURTMALARINGIZ</b>\\n\\n"
     
     for i, order in enumerate(recent_orders, 1):
         status_emoji = {
@@ -857,11 +869,11 @@ async def show_user_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, o
         total = format_price(order.get('total', 0))
         created = order.get('created_at', '')[:10]
         
-        orders_text += f"{i}. {status_emoji} <b>#{order_id_short}</b> - {total} so'm\n"
-        orders_text += f"   📅 {created} | {status_text}\n\n"
+        orders_text += f"{i}. {status_emoji} <b>#{order_id_short}</b> - {total} so'm\\n"
+        orders_text += f"   📅 {created} | {status_text}\\n\\n"
     
     if len(orders) > 5:
-        orders_text += f"... va yana {len(orders) - 5} ta buyurtma\n"
+        orders_text += f"... va yana {len(orders) - 5} ta buyurtma\\n"
     
     keyboard = [
         [InlineKeyboardButton("🍽️ Yangi buyurtma", web_app=WebAppInfo(url=WEBAPP_URL))]
@@ -899,7 +911,7 @@ async def notify_admin_auto_accepted(context_or_bot, order: Dict):
         if isinstance(items, str):
             items = json.loads(items)
         
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        items_text = "\\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
         
         # Telefon raqamini formatlash
         raw_phone = order.get('phone', '')
@@ -915,13 +927,13 @@ async def notify_admin_auto_accepted(context_or_bot, order: Dict):
                 lat, lng = str(location).split(',')
                 lat = float(lat.strip())
                 lng = float(lng.strip())
-                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+                location_text = f"\\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko\\'rish</a>"
                 location_coords = (lat, lng)
             except Exception as e:
                 logger.warning(f"Joylashuv parse xatosi: {e}")
-                location_text = f"\n📍 <b>Manzil:</b> {location}"
+                location_text = f"\\n📍 <b>Manzil:</b> {location}"
         elif location:
-            location_text = f"\n📍 <b>Manzil:</b> {location}"
+            location_text = f"\\n📍 <b>Manzil:</b> {location}"
         
         message = f"""⚡ <b>AVTOMATIK QABUL QILINDI!</b>
 
