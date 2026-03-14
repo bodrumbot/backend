@@ -101,6 +101,59 @@ def init_database():
             )
         """)
         
+        # ⭐ YANGI USTUNLARNI TEKSHIRISH VA QO'SHISH
+        # initiated_from ustuni yo'qmi?
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'orders' AND column_name = 'initiated_from'
+        """)
+        if not cur.fetchone():
+            cur.execute("""
+                ALTER TABLE orders 
+                ADD COLUMN initiated_from VARCHAR(50) DEFAULT 'website'
+            """)
+            logger.info("✅ 'initiated_from' ustuni qo'shildi")
+        
+        # source ustuni yo'qmi?
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'orders' AND column_name = 'source'
+        """)
+        if not cur.fetchone():
+            cur.execute("""
+                ALTER TABLE orders 
+                ADD COLUMN source VARCHAR(50) DEFAULT 'website'
+            """)
+            logger.info("✅ 'source' ustuni qo'shildi")
+        
+        # auto_accepted ustuni yo'qmi?
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'orders' AND column_name = 'auto_accepted'
+        """)
+        if not cur.fetchone():
+            cur.execute("""
+                ALTER TABLE orders 
+                ADD COLUMN auto_accepted BOOLEAN DEFAULT FALSE
+            """)
+            logger.info("✅ 'auto_accepted' ustuni qo'shildi")
+        
+        # transaction_id ustuni yo'qmi?
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'orders' AND column_name = 'transaction_id'
+        """)
+        if not cur.fetchone():
+            cur.execute("""
+                ALTER TABLE orders 
+                ADD COLUMN transaction_id VARCHAR(100)
+            """)
+            logger.info("✅ 'transaction_id' ustuni qo'shildi")
+        
         # 2. Users jadvali
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -127,6 +180,8 @@ def init_database():
         
     except Exception as e:
         logger.error(f"❌ Database init error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
     finally:
         if conn:
@@ -981,7 +1036,7 @@ async def notify_admin_and_customer(order: Dict, is_webapp: bool = False):
                 lat, lng = str(location).split(',')
                 lat = float(lat.strip())
                 lng = float(lng.strip())
-                location_text = f"\\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+                location_text = f"\\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko\\'rish</a>"
                 location_coords = (lat, lng)
             except Exception as e:
                 logger.warning(f"Joylashuv parse xatosi: {e}")
