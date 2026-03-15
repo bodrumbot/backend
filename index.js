@@ -1,6 +1,10 @@
+// ==========================================
+// BODRUM SERVER - FAQAT POLLING
+// Payme callback O'CHIRILDI
+// ==========================================
+
 const express = require('express');
 const { createServer } = require('http');
-const { Server } = require('socket.io');
 const { PrismaClient } = require('@prisma/client');
 const cors = require('cors');
 const path = require('path');
@@ -9,7 +13,7 @@ const prisma = new PrismaClient();
 const app = express();
 const httpServer = createServer(app);
 
-// CORS sozlamalari
+// CORS
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -18,18 +22,20 @@ app.use(cors({
 
 app.use(express.json());
 
-// Socket.io
-const io = new Server(httpServer, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
-});
-
-// Static files (WebApp)
+// Static files
 app.use(express.static(path.join(__dirname, '../webapp')));
 
 // ===================== API ROUTES =====================
+
+// Health check
+app.get('/health', async (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    mode: 'POLLING_ONLY',
+    message: 'Payme callback o\'chirildi, faqat polling'
+  });
+});
 
 // Barcha buyurtmalarni olish
 app.get('/api/orders', async (req, res) => {
@@ -39,8 +45,7 @@ app.get('/api/orders', async (req, res) => {
         OR: [
           { paymentStatus: 'paid' },
           { status: 'accepted' },
-          { status: 'rejected' },
-          { status: 'payment_pending' }
+          { status: 'rejected' }
         ]
       },
       orderBy: { createdAt: 'desc' }
@@ -52,13 +57,12 @@ app.get('/api/orders', async (req, res) => {
   }
 });
 
-// Yangi buyurtmalarni olish (payment_pending + paid)
+// Yangi buyurtmalarni olish
 app.get('/api/orders/new', async (req, res) => {
   try {
     const orders = await prisma.order.findMany({
       where: {
-        paymentStatus: 'paid',
-        status: 'payment_pending'
+        status: 'pending_payment'
       },
       orderBy: { createdAt: 'desc' }
     });
@@ -81,17 +85,43 @@ app.get('/api/orders/:orderId', async (req, res) => {
   }
 });
 
+// ⭐ TO'LOV STATUSINI YANGILASH (Frontend dan chaqiriladi)
+app.post('/api/orders/:orderId/payment', async (req, res) => {
+  try {
+    const { status, transactionId } = req.body;
+    
+    const order = await prisma.order.update({
+      where: { orderId: req.params.orderId },
+      data: {
+        paymentStatus: status,
+        transactionId: transactionId,
+        status: status === 'paid' ? 'pending_payment' : 'rejected',
+        paidAt: status === 'paid' ? new Date() : null
+      }
+    });
+    
+    res.json({ success: true, order });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Yangi buyurtma yaratish
 app.post('/api/orders', async (req, res) => {
   try {
     const order = await prisma.order.create({
-      data: req.body
+      data: {
+        ...req.body,
+        status: 'pending_payment',
+        paymentStatus: 'pending'
+      }
     });
     
-    // Socket.io orqali adminlarga xabar
-    io.emit('new_order', order);
-    
-    res.json(order);
+    res.json({
+      ...order,
+      polling_started: true,
+      message: "Buyurtma yaratildi. To'lov 15 daqiqa ichida amalga oshirilishi kerak."
+    });
   } catch (error) {
     console.error('Create order error:', error);
     res.status(500).json({ error: error.message });
@@ -106,82 +136,54 @@ app.put('/api/orders/:orderId', async (req, res) => {
       data: req.body
     });
     
-    // Socket.io orqali yangilanish
-    io.emit('order_updated', order);
-    
     res.json(order);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// ===================== PAYME CALLBACK =====================
+// ===================== PAYME CALLBACK - O'CHIRILDI =====================
+// ❌ Payme callback endi yo'q! Faqat polling ishlatiladi
 
-app.post('/api/payme/callback', async (req, res) => {
+// ===================== USER PROFILE =====================
+
+app.post('/api/user/profile', async (req, res) => {
   try {
-    const { order_id, status } = req.body;
+    const { tgId } = req.body;
     
-    console.log('💰 Payme callback:', order_id, status);
+    const profile = await prisma.user.findUnique({
+      where: { tgId: parseInt(tgId) }
+    });
     
-    if (status === 'success') {
-      const order = await prisma.order.update({
-        where: { orderId: order_id },
-        data: {
-          paymentStatus: 'paid',
-          status: 'payment_pending',
-          notified: false
-        }
-      });
-      
-      // Socket.io orqali xabar
-      io.emit('payment_success', order);
-      io.emit('new_order', order);
-      
-      res.json({ success: true, order });
-    } else {
-      await prisma.order.update({
-        where: { orderId: order_id },
-        data: {
-          paymentStatus: 'failed',
-          status: 'rejected'
-        }
-      });
-      
-      res.json({ success: true });
-    }
+    const orders = await prisma.order.findMany({
+      where: { tgId: parseInt(tgId) },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    res.json({ success: true, profile, orders });
   } catch (error) {
-    console.error('Payme callback error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ===================== SOCKET.IO =====================
-
-io.on('connection', (socket) => {
-  console.log('✅ Client connected:', socket.id);
-  
-  // Admin qo'shilganda yangi buyurtmalarni yuborish
-  socket.on('admin_join', async () => {
-    const newOrders = await prisma.order.findMany({
-      where: {
-        paymentStatus: 'paid',
-        status: 'payment_pending'
-      }
+app.post('/api/user/save-profile', async (req, res) => {
+  try {
+    const { tgId, name, phone, username } = req.body;
+    
+    const profile = await prisma.user.upsert({
+      where: { tgId: parseInt(tgId) },
+      update: { name, phone, username },
+      create: { tgId: parseInt(tgId), name, phone, username }
     });
-    socket.emit('initial_orders', newOrders);
-  });
-  
-  socket.on('disconnect', () => {
-    console.log('❌ Client disconnected:', socket.id);
-  });
-});
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    
+    res.json({ success: true, profile });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`⏰ POLLING ONLY - Payme callback o'chirildi`);
 });
