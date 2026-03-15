@@ -490,21 +490,98 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
 # ⭐ FAQAT POLLING - Payme callback O'CHIRILDI
 # ==========================================
 
+# ==========================================
+# ⭐ TO'LOV STATUSINI FRONTEND DAN QABUL QILISH
+# ==========================================
+
+async def update_payment_status_handler(request):
+    """Frontend dan to'lov statusini yangilash"""
+    try:
+        order_id = request.match_info['order_id']
+        data = await request.json()
+        
+        status = data.get('status')  # 'paid' yoki 'pending'
+        transaction_id = data.get('transactionId')
+        
+        logger.info(f"💰 To'lov statusi yangilanmoqda: {order_id} -> {status}, tx: {transaction_id}")
+        
+        # Avval ustun mavjudligini tekshirish
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'orders' AND column_name = 'paid_at'
+        """)
+        has_paid_at = cur.fetchone() is not None
+        cur.close()
+        conn.close()
+        
+        # Yangilash
+        if has_paid_at:
+            updated = update_order_status(
+                order_id,
+                'pending_payment',  # Status o'zgarmaydi, faqat payment_status
+                payment_status=status,
+                transaction_id=transaction_id,
+                paid_at=datetime.utcnow().isoformat() if status == 'paid' else None
+            )
+        else:
+            updated = update_order_status(
+                order_id,
+                'pending_payment',
+                payment_status=status,
+                transaction_id=transaction_id
+            )
+        
+        if updated:
+            # Agar to'lov qilingan bo'lsa, admin va mijozga xabar
+            if status == 'paid':
+                await notify_admin_and_customer(updated, updated.get('tg_id') is not None)
+                
+                # PENDING_PAYMENTS dan o'chirish
+                global PENDING_PAYMENTS
+                if order_id in PENDING_PAYMENTS:
+                    del PENDING_PAYMENTS[order_id]
+            
+            return web.json_response({
+                "success": True,
+                "order": updated,
+                "message": f"To'lov statusi {status} ga o'zgartirildi"
+            }, headers=get_cors_headers())
+        else:
+            return web.json_response({
+                "success": False,
+                "error": "Buyurtma topilmadi"
+            }, status=404, headers=get_cors_headers())
+            
+    except Exception as e:
+        logger.error(f"❌ To'lov statusini yangilashda xato: {e}")
+        import traceback
+        traceback.print_exc()
+        return web.json_response({
+            "success": False,
+            "error": str(e)
+        }, status=500, headers=get_cors_headers())
+
+# Route qo'shish (main() funksiyasida)
+# app.router.add_post('/api/orders/{order_id}/payment', update_payment_status_handler)
+
 async def check_payment_status(order_id: str) -> Dict[str, Any]:
     """
-    ⭐ FAQAT DATABASE DAN TEKSHIRISH - Payme callback yo'q!
-    Frontend to'lov qilganini database ga yozadi, biz shu yerda tekshiramiz
+    Database dan to'lov statusini tekshirish
     """
     try:
         order = get_order(order_id)
         if not order:
             return {"success": False, "error": "Order not found"}
         
-        # Database dan tekshirish - frontend to'lov qilganini yozgan bo'lishi kerak
+        # Database dan tekshirish
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # ⭐ AVVAL ustun mavjudligini tekshiramiz
+        # Ustun mavjudligini tekshirish
         cur.execute("""
             SELECT column_name 
             FROM information_schema.columns 
@@ -519,7 +596,6 @@ async def check_payment_status(order_id: str) -> Dict[str, Any]:
                 WHERE order_id = %s
             """, (order_id,))
         else:
-            # ⭐ Eski versiya - paid_at ustuni yo'q
             cur.execute("""
                 SELECT payment_status, transaction_id, created_at as paid_at 
                 FROM orders 
@@ -531,16 +607,17 @@ async def check_payment_status(order_id: str) -> Dict[str, Any]:
         conn.close()
         
         if result:
-            # ⭐ transaction_id mavjud bo'lsa, to'lov qilingan deb hisoblaymiz
+            # ⭐ MUHIM: transaction_id mavjud bo'lsa yoki payment_status = 'paid' bo'lsa
             if result['transaction_id'] or result['payment_status'] == 'paid':
                 return {
                     "success": True,
                     "paid": True,
                     "transaction_id": result['transaction_id'],
-                    "paid_at": result['paid_at'].isoformat() if result['paid_at'] else None
+                    "paid_at": result['paid_at'].isoformat() if result['paid_at'] else None,
+                    "payment_status": result['payment_status']
                 }
         
-        # Vaqt tekshiruvi - 15 daqiqa o'tgan bo'lsa bekor qilish
+        # Vaqt tekshiruvi
         created_at = order.get('created_at')
         if isinstance(created_at, str):
             created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00').replace('+00:00', ''))
@@ -548,7 +625,7 @@ async def check_payment_status(order_id: str) -> Dict[str, Any]:
         if datetime.utcnow() - created_at > timedelta(minutes=MAX_POLLING_MINUTES):
             return {"success": True, "paid": False, "expired": True}
         
-        return {"success": True, "paid": False, "pending": True}
+        return {"success": True, "paid": False, "pending": True, "payment_status": result.get('payment_status') if result else 'pending'}
         
     except Exception as e:
         logger.error(f"❌ To'lov tekshiruvi xatosi: {e}")
@@ -1660,7 +1737,9 @@ def main():
     app.router.add_post('/api/orders', create_order_handler)
     app.router.add_get('/api/orders/{order_id}', get_order_handler)
     app.router.add_put('/api/orders/{order_id}', update_order_handler)
-    
+    app.router.add_post('/api/orders/{order_id}/payment', update_payment_status_handler)
+    app.router.add_options('/api/orders/{order_id}/payment', options_handler)
+
     # ⭐ POLLING API - Payme callback yo'q!
     app.router.add_get('/api/orders/{order_id}/payment-status', check_payment_handler)
     
