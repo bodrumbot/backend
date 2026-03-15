@@ -108,7 +108,11 @@ def init_database():
             ('initiated_from', 'VARCHAR(50) DEFAULT \'website\''),
             ('source', 'VARCHAR(50) DEFAULT \'website\''),
             ('auto_accepted', 'BOOLEAN DEFAULT FALSE'),
-            ('transaction_id', 'VARCHAR(100)')
+            ('transaction_id', 'VARCHAR(100)'),
+            ('paid_at', 'TIMESTAMP'),           # ⭐ QO'SHILDI
+            ('confirmed_at', 'TIMESTAMP'),      # ⭐ QO'SHILDI
+            ('accepted_at', 'TIMESTAMP'),       # ⭐ QO'SHILDI
+            ('rejected_at', 'TIMESTAMP')        # ⭐ QO'SHILDI
         ]
         
         for col_name, col_type in columns_to_check:
@@ -418,15 +422,38 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         cur = conn.cursor()
         
         update_data = {'status': status}
-        if status == 'accepted':
-            update_data['accepted_at'] = datetime.utcnow().isoformat()
-        elif status == 'rejected':
-            update_data['rejected_at'] = datetime.utcnow().isoformat()
-        elif status == 'confirmed':
-            update_data['confirmed_at'] = datetime.utcnow().isoformat()
         
+        # ⭐ Har bir timestamp ustuni uchun alohida tekshirish
+        timestamp_fields = {
+            'accepted': 'accepted_at',
+            'rejected': 'rejected_at', 
+            'confirmed': 'confirmed_at'
+        }
+        
+        if status in timestamp_fields:
+            field_name = timestamp_fields[status]
+            # Ustun mavjudligini tekshirish
+            cur.execute(f"""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'orders' AND column_name = '{field_name}'
+            """)
+            if cur.fetchone():
+                update_data[field_name] = datetime.utcnow().isoformat()
+        
+        # paid_at alohida tekshirish
+        if kwargs.get('paid_at'):
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'orders' AND column_name = 'paid_at'
+            """)
+            if cur.fetchone():
+                update_data['paid_at'] = kwargs.get('paid_at')
+        
+        # Qolgan fieldlar
         for key, val in kwargs.items():
-            if val is not None:
+            if val is not None and key not in ['paid_at']:  # paid_at alohida qo'shildi
                 update_data[key] = val
         
         fields = []
@@ -476,22 +503,41 @@ async def check_payment_status(order_id: str) -> Dict[str, Any]:
         # Database dan tekshirish - frontend to'lov qilganini yozgan bo'lishi kerak
         conn = get_db_connection()
         cur = conn.cursor()
+        
+        # ⭐ AVVAL ustun mavjudligini tekshiramiz
         cur.execute("""
-            SELECT payment_status, transaction_id, paid_at 
-            FROM orders 
-            WHERE order_id = %s
-        """, (order_id,))
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'orders' AND column_name = 'paid_at'
+        """)
+        has_paid_at = cur.fetchone() is not None
+        
+        if has_paid_at:
+            cur.execute("""
+                SELECT payment_status, transaction_id, paid_at 
+                FROM orders 
+                WHERE order_id = %s
+            """, (order_id,))
+        else:
+            # ⭐ Eski versiya - paid_at ustuni yo'q
+            cur.execute("""
+                SELECT payment_status, transaction_id, created_at as paid_at 
+                FROM orders 
+                WHERE order_id = %s
+            """, (order_id,))
+            
         result = cur.fetchone()
         cur.close()
         conn.close()
         
         if result:
-            if result['payment_status'] == 'paid' or result['transaction_id']:
+            # ⭐ transaction_id mavjud bo'lsa, to'lov qilingan deb hisoblaymiz
+            if result['transaction_id'] or result['payment_status'] == 'paid':
                 return {
                     "success": True,
                     "paid": True,
                     "transaction_id": result['transaction_id'],
-                    "paid_at": result['paid_at']
+                    "paid_at": result['paid_at'].isoformat() if result['paid_at'] else None
                 }
         
         # Vaqt tekshiruvi - 15 daqiqa o'tgan bo'lsa bekor qilish
@@ -506,6 +552,8 @@ async def check_payment_status(order_id: str) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"❌ To'lov tekshiruvi xatosi: {e}")
+        import traceback
+        traceback.print_exc()
         return {"success": False, "error": str(e)}
 
 async def polling_payment_check(context: ContextTypes.DEFAULT_TYPE):
@@ -560,14 +608,36 @@ async def polling_payment_check(context: ContextTypes.DEFAULT_TYPE):
             if result.get('paid'):
                 logger.info(f"✅ To'lov topildi: {order_id}")
                 
-                updated = update_order_status(
-                    order_id, 
-                    'accepted',
-                    payment_status='paid',
-                    paid_at=datetime.utcnow().isoformat(),
-                    auto_accepted=True,
-                    transaction_id=result.get('transaction_id')
-                )
+                # ⭐ AVVAL ustun mavjudligini tekshiramiz
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'orders' AND column_name = 'paid_at'
+                """)
+                has_paid_at = cur.fetchone() is not None
+                cur.close()
+                conn.close()
+                
+                if has_paid_at:
+                    updated = update_order_status(
+                        order_id, 
+                        'accepted',
+                        payment_status='paid',
+                        paid_at=datetime.utcnow().isoformat(),
+                        auto_accepted=True,
+                        transaction_id=result.get('transaction_id')
+                    )
+                else:
+                    # ⭐ Eski versiya - paid_at ustuni yo'q
+                    updated = update_order_status(
+                        order_id, 
+                        'accepted',
+                        payment_status='paid',
+                        auto_accepted=True,
+                        transaction_id=result.get('transaction_id')
+                    )
                 
                 if updated:
                     await notify_admin_and_customer(updated, data.get('tg_id') is not None)
