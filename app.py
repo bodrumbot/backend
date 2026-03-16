@@ -25,6 +25,8 @@ from telegram.ext import (
 )
 from aiohttp import web
 import json
+import aiohttp_cors
+
 
 load_dotenv()
 
@@ -856,18 +858,20 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
 
 def get_cors_headers():
     return {
-        'Access-Control-Allow-Origin': '*',  # Yoki aniq domen: 'https://bodrumbot.github.io'
+        'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+        'Access-Control-Allow-Headers': '*',  # ⭐ BARCHA headerlar ruxsat etiladi
         'Access-Control-Max-Age': '86400',
     }
 
 # OPTIONS handler - MUHIM!
 async def options_handler(request):
     """CORS preflight so'rovlarini qaytarish"""
-    headers = get_cors_headers()
-    headers['Content-Type'] = 'application/json'
-    return web.Response(status=200, headers=headers, body='{}')
+    return web.Response(
+        status=200,
+        headers=get_cors_headers(),
+        body='{}'
+    )
 
 # ==========================================
 # TELEGRAM BOT FUNCTIONS
@@ -1873,6 +1877,36 @@ def main():
     
     app = web.Application()
     
+    # ⭐ GLOBAL CORS MIDDLEWARE
+    async def cors_middleware(app, handler):
+        async def middleware_handler(request):
+            # OPTIONS so'rovlariga darhol javob
+            if request.method == 'OPTIONS':
+                return web.Response(
+                    status=200,
+                    headers={
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Cache-Control, Pragma, Accept',
+                        'Access-Control-Max-Age': '86400',
+                    }
+                )
+            
+            # Asosiy so'rovni ishga tushirish
+            response = await handler(request)
+            
+            # CORS headerlarini qo'shish
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With, Cache-Control, Pragma, Accept'
+            
+            return response
+        
+        return middleware_handler
+    
+    # Middleware ni qo'shish
+    app.middlewares.append(cors_middleware)
+    
     # Routes
     app.router.add_get('/', health_handler)
     app.router.add_get('/health', health_handler)
@@ -1884,27 +1918,16 @@ def main():
     app.router.add_get('/api/orders/{order_id}', get_order_handler)
     app.router.add_put('/api/orders/{order_id}', update_order_handler)
     app.router.add_post('/api/orders/{order_id}/payment', update_payment_status_handler)
-    app.router.add_options('/api/orders/{order_id}/payment', options_handler)
-
-    # ⭐ POLLING API - Payme callback yo'q!
-    app.router.add_get('/api/orders/{order_id}/payment-status', check_payment_handler)
     
-    # CORS preflight
-    app.router.add_options('/api/orders', options_handler)
-    app.router.add_options('/api/orders/{order_id}', options_handler)
-    app.router.add_options('/api/orders/{order_id}/payment-status', options_handler)
+    # ⭐ POLLING API
+    app.router.add_get('/api/orders/{order_id}/payment-status', check_payment_handler)
     
     # User profile API
     app.router.add_post('/api/user/profile', get_user_profile_api)
-    app.router.add_options('/api/user/profile', options_handler)
-    
     app.router.add_post('/api/user/save-profile', save_user_profile_api)
-    app.router.add_options('/api/user/save-profile', options_handler)
     
     # Webhook
     app.router.add_post('/webhook', webhook_handler)
-    
-    # ⭐ PAYME CALLBACK ROUTE O'CHIRILDI
     
     app.on_startup.append(init_webhook)
     app.on_cleanup.append(shutdown)
