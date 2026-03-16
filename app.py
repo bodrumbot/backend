@@ -491,7 +491,7 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
 # ==========================================
 
 async def update_payment_status_handler(request):
-    """Frontend dan to'lov statusini yangilash"""
+    """Frontend dan to'lov statusini yangilash - AVtomatik qabul qilish bilan"""
     try:
         order_id = request.match_info['order_id']
         data = await request.json()
@@ -501,56 +501,50 @@ async def update_payment_status_handler(request):
         
         logger.info(f"💰 To'lov statusi yangilanmoqda: {order_id} -> {status}, tx: {transaction_id}")
         
-        # Avval ustun mavjudligini tekshirish
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'orders' AND column_name = 'paid_at'
-        """)
-        has_paid_at = cur.fetchone() is not None
-        cur.close()
-        conn.close()
-        
-        # Yangilash
-        if has_paid_at:
+        if status == 'paid':
+            # ⭐ MUHIM: Avtomatik qabul qilish!
             updated = update_order_status(
                 order_id,
-                'pending_payment',  # Status o'zgarmaydi, faqat payment_status
-                payment_status=status,
+                'accepted',  # 'pending_payment' emas, 'accepted'!
+                payment_status='paid',
                 transaction_id=transaction_id,
-                paid_at=datetime.utcnow().isoformat() if status == 'paid' else None
+                paid_at=datetime.utcnow().isoformat(),
+                auto_accepted=True  # Avtomatik qabul qilinganini belgilash
             )
-        else:
-            updated = update_order_status(
-                order_id,
-                'pending_payment',
-                payment_status=status,
-                transaction_id=transaction_id
-            )
-        
-        if updated:
-            # Agar to'lov qilingan bo'lsa, admin va mijozga xabar
-            if status == 'paid':
-                await notify_admin_and_customer(updated, updated.get('tg_id') is not None)
-                
+            
+            if updated:
                 # PENDING_PAYMENTS dan o'chirish
                 global PENDING_PAYMENTS
                 if order_id in PENDING_PAYMENTS:
                     del PENDING_PAYMENTS[order_id]
-            
-            return web.json_response({
-                "success": True,
-                "order": updated,
-                "message": f"To'lov statusi {status} ga o'zgartirildi"
-            }, headers=get_cors_headers())
-        else:
-            return web.json_response({
-                "success": False,
-                "error": "Buyurtma topilmadi"
-            }, status=404, headers=get_cors_headers())
+                
+                # ⭐ Admin va mijozga xabar yuborish
+                await notify_admin_and_customer(updated, updated.get('tg_id') is not None)
+                
+                return web.json_response({
+                    "success": True,
+                    "order": updated,
+                    "message": "To'lov qabul qilindi va buyurtma avtomatik tasdiqlandi"
+                }, headers=get_cors_headers())
+            else:
+                return web.json_response({
+                    "success": False,
+                    "error": "Buyurtma topilmadi"
+                }, status=404, headers=get_cors_headers())
+        
+        # Agar status 'paid' emas bo'lsa
+        updated = update_order_status(
+            order_id,
+            'pending_payment',
+            payment_status=status,
+            transaction_id=transaction_id
+        )
+        
+        return web.json_response({
+            "success": True,
+            "order": updated,
+            "message": f"To'lov statusi {status} ga o'zgartirildi"
+        }, headers=get_cors_headers())
             
     except Exception as e:
         logger.error(f"❌ To'lov statusini yangilashda xato: {e}")
@@ -1369,7 +1363,7 @@ async def notify_admin_and_customer(order: Dict, is_webapp: bool = False):
                 lat, lng = str(location).split(',')
                 lat = float(lat.strip())
                 lng = float(lng.strip())
-                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko\'rish</a>"
+                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
                 location_coords = (lat, lng)
             except Exception as e:
                 logger.warning(f"Joylashuv parse xatosi: {e}")
@@ -1404,16 +1398,17 @@ async def notify_admin_and_customer(order: Dict, is_webapp: bool = False):
         if location_coords and admin_sent:
             send_telegram_location(ADMIN_CHAT_ID_INT, location_coords[0], location_coords[1])
         
+        # Mijozga xabar (faqat WebApp dan bo'lsa)
         if is_webapp:
             tg_id = order.get('tg_id')
             if tg_id:
-                customer_message = f"""✅ <b>Buyurtmangiz qabul qilindi!</b>
+                customer_message = f"""✅ <b>Buyurtmangiz avtomatik qabul qilindi!</b>
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 💵 Summa: {format_price(order.get('total', 0))} so'm
 💳 To'lov: Payme ✅
 
-Buyurtmangiz muvaffaqiyatli to'landi va qabul qilindi!
+Buyurtmangiz to'lov qilingani uchun avtomatik qabul qilindi!
 
 Tez orada yetkazib beramiz! 🚀
 
