@@ -1,6 +1,6 @@
 # ==========================================
 # BODRUM BOT - FAQAT POLLING TIZIMI
-# Payme callback O'CHIRILDI, faqat polling
+# PAYME_MERCHANT_ID callback O'CHIRILDI, faqat polling
 # ==========================================
 
 import os
@@ -11,7 +11,7 @@ import psycopg2.extras
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 import requests
-
+import time
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -490,14 +490,13 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
 # ⭐ TO'LOV STATUSINI FRONTEND DAN QABUL QILISH
 # ==========================================
 
+
 async def update_payment_status_handler(request):
-    """Frontend dan to'lov statusini yangilash"""
+    """Frontend dan to'lov statusini yangilash - ISHONCHLI"""
     try:
         order_id = request.match_info['order_id']
         
-        # ⭐ DEBUG LOG
-        logger.info(f"🔔🔔🔔 PAYMENT ENDPOINT CHAQIRILDI: {order_id}")
-        logger.info(f"📍 Headers: {dict(request.headers)}")
+        logger.info(f"🔔🔔🔔 PAYMENT ENDPOINT: {order_id}")
         
         data = await request.json()
         logger.info(f"📦 Data: {data}")
@@ -505,48 +504,67 @@ async def update_payment_status_handler(request):
         status = data.get('status')
         transaction_id = data.get('transactionId')
         
-        logger.info(f"💰 To'lov statusi: {order_id} -> {status}")
-        
         if status == 'paid':
-            # Avtomatik qabul qilish
+            # ⭐ ISHONCHLI: avval order mavjudligini tekshirish
+            existing_order = get_order(order_id)
+            if not existing_order:
+                return web.json_response({
+                    "success": False,
+                    "error": "Order not found"
+                }, status=404, headers=get_cors_headers())
+            
+            # ⭐ ISHONCHLI: agar allaqachon paid bo'lsa, qayta ishlamaslik
+            if existing_order.get('payment_status') == 'paid':
+                logger.info(f"⚠️ Order {order_id} allaqachon paid")
+                return web.json_response({
+                    "success": True,
+                    "order": existing_order,
+                    "message": "Already paid",
+                    "already_paid": True
+                }, headers=get_cors_headers())
+            
+            # ⭐ MUHIM: to'g'ri status va timestamp
             updated = update_order_status(
                 order_id,
-                'accepted',  # MUHIM: 'accepted' emas!
+                'accepted',  # 'pending' emas, to'g'ridan-to'g'ri 'accepted'
                 payment_status='paid',
                 transaction_id=transaction_id,
                 paid_at=datetime.utcnow().isoformat(),
+                accepted_at=datetime.utcnow().isoformat(),  # ⭐ QO'SHILDI
                 auto_accepted=True
             )
             
             if updated:
-                # PENDING_PAYMENTS dan o'chirish
+                # Global dan o'chirish
                 global PENDING_PAYMENTS
                 if order_id in PENDING_PAYMENTS:
                     del PENDING_PAYMENTS[order_id]
-                    logger.info(f"🗑️ PENDING_PAYMENTS dan o'chirildi: {order_id}")
                 
-                # Admin va mijozga xabar
-                await notify_admin_and_customer(updated, updated.get('tg_id') is not None)
+                # ⭐ ISHONCHLI: async notification
+                asyncio.create_task(notify_admin_and_customer(updated, True))
                 
-                logger.info(f"✅✅✅ BUYURTMA AVTOMATIK QABUL QILINDI: {order_id}")
+                logger.info(f"✅✅✅ BUYURTMA QABUL QILINDI: {order_id}")
                 
                 return web.json_response({
                     "success": True,
                     "order": updated,
-                    "message": "To'lov qabul qilindi va buyurtma avtomatik tasdiqlandi"
+                    "message": "To'lov qabul qilindi va buyurtma tasdiqlandi",
+                    "auto_accepted": True
                 }, headers=get_cors_headers())
         
-        # ... qolgan kod
+        return web.json_response({
+            "success": False,
+            "error": "Invalid status"
+        }, status=400, headers=get_cors_headers())
         
     except Exception as e:
-        logger.error(f"❌❌❌ PAYMENT ENDPOINT XATOSI: {e}")
+        logger.error(f"❌❌❌ PAYMENT XATOSI: {e}")
         import traceback
         traceback.print_exc()
         return web.json_response({
             "success": False,
             "error": str(e)
         }, status=500, headers=get_cors_headers())
-
 
 
 async def check_payment_status(order_id: str) -> Dict[str, Any]:
@@ -1497,14 +1515,59 @@ async def get_order_handler(request):
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
 async def check_payment_handler(request):
-    """⭐ Frontend dan to'lov statusini so'rash"""
+    """⭐ ISHONCHLI POLLING - Database dan tekshirish"""
     try:
         order_id = request.match_info['order_id']
-        result = await check_payment_status(order_id)
-        return web.json_response(result, headers=get_cors_headers())
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # ⭐ ISHONCHLI: transaction_id ham tekshirish
+        cur.execute("""
+            SELECT order_id, payment_status, transaction_id, paid_at, status, total, auto_accepted
+            FROM orders 
+            WHERE order_id = %s
+        """, (order_id,))
+        
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not result:
+            return web.json_response({
+                "success": False,
+                "error": "Order not found"
+            }, status=404, headers=get_cors_headers())
+        
+        order = dict(result)
+        
+        # ⭐ ISHONCHLI: transaction_id mavjudligini ham tekshirish
+        is_paid = (
+            order.get('payment_status') == 'paid' or 
+            order.get('transaction_id') is not None or
+            order.get('status') == 'accepted'
+        )
+        
+        response = {
+            "success": True,
+            "paid": is_paid,
+            "payment_status": order.get('payment_status'),
+            "status": order.get('status'),
+            "transaction_id": order.get('transaction_id'),
+            "auto_accepted": order.get('auto_accepted', False),
+            "amount": order.get('total'),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        logger.info(f"🔍 Polling {order_id}: paid={is_paid}")
+        return web.json_response(response, headers=get_cors_headers())
+        
     except Exception as e:
         logger.error(f"Check payment error: {e}")
-        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+        return web.json_response({
+            "success": False,
+            "error": str(e)
+        }, status=500, headers=get_cors_headers())
 
 async def orders_list_handler(request):
     """Barcha buyurtmalarni olish - FAQAT QABUL QILINGANLAR"""
