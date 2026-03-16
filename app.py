@@ -491,25 +491,31 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
 # ==========================================
 
 async def update_payment_status_handler(request):
-    """Frontend dan to'lov statusini yangilash - AVtomatik qabul qilish bilan"""
+    """Frontend dan to'lov statusini yangilash"""
     try:
         order_id = request.match_info['order_id']
-        data = await request.json()
         
-        status = data.get('status')  # 'paid' yoki 'pending'
+        # ⭐ DEBUG LOG
+        logger.info(f"🔔🔔🔔 PAYMENT ENDPOINT CHAQIRILDI: {order_id}")
+        logger.info(f"📍 Headers: {dict(request.headers)}")
+        
+        data = await request.json()
+        logger.info(f"📦 Data: {data}")
+        
+        status = data.get('status')
         transaction_id = data.get('transactionId')
         
-        logger.info(f"💰 To'lov statusi yangilanmoqda: {order_id} -> {status}, tx: {transaction_id}")
+        logger.info(f"💰 To'lov statusi: {order_id} -> {status}")
         
         if status == 'paid':
-            # ⭐ MUHIM: Avtomatik qabul qilish!
+            # Avtomatik qabul qilish
             updated = update_order_status(
                 order_id,
-                'accepted',  # 'pending_payment' emas, 'accepted'!
+                'accepted',  # MUHIM: 'accepted' emas!
                 payment_status='paid',
                 transaction_id=transaction_id,
                 paid_at=datetime.utcnow().isoformat(),
-                auto_accepted=True  # Avtomatik qabul qilinganini belgilash
+                auto_accepted=True
             )
             
             if updated:
@@ -517,37 +523,23 @@ async def update_payment_status_handler(request):
                 global PENDING_PAYMENTS
                 if order_id in PENDING_PAYMENTS:
                     del PENDING_PAYMENTS[order_id]
+                    logger.info(f"🗑️ PENDING_PAYMENTS dan o'chirildi: {order_id}")
                 
-                # ⭐ Admin va mijozga xabar yuborish
+                # Admin va mijozga xabar
                 await notify_admin_and_customer(updated, updated.get('tg_id') is not None)
+                
+                logger.info(f"✅✅✅ BUYURTMA AVTOMATIK QABUL QILINDI: {order_id}")
                 
                 return web.json_response({
                     "success": True,
                     "order": updated,
                     "message": "To'lov qabul qilindi va buyurtma avtomatik tasdiqlandi"
                 }, headers=get_cors_headers())
-            else:
-                return web.json_response({
-                    "success": False,
-                    "error": "Buyurtma topilmadi"
-                }, status=404, headers=get_cors_headers())
         
-        # Agar status 'paid' emas bo'lsa
-        updated = update_order_status(
-            order_id,
-            'pending_payment',
-            payment_status=status,
-            transaction_id=transaction_id
-        )
+        # ... qolgan kod
         
-        return web.json_response({
-            "success": True,
-            "order": updated,
-            "message": f"To'lov statusi {status} ga o'zgartirildi"
-        }, headers=get_cors_headers())
-            
     except Exception as e:
-        logger.error(f"❌ To'lov statusini yangilashda xato: {e}")
+        logger.error(f"❌❌❌ PAYMENT ENDPOINT XATOSI: {e}")
         import traceback
         traceback.print_exc()
         return web.json_response({
@@ -846,12 +838,18 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
 
 def get_cors_headers():
     return {
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': '*',  # Yoki aniq domen: 'https://bodrumbot.github.io'
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
         'Access-Control-Max-Age': '86400',
     }
 
+# OPTIONS handler - MUHIM!
+async def options_handler(request):
+    return web.Response(headers=get_cors_headers())
+
+# Route larni tekshiring
+app.router.add_options('/api/orders/{order_id}/payment', options_handler)
 # ==========================================
 # TELEGRAM BOT FUNCTIONS
 # ==========================================
