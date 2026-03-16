@@ -487,10 +487,6 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
             conn.close()
 
 # ==========================================
-# ⭐ FAQAT POLLING - Payme callback O'CHIRILDI
-# ==========================================
-
-# ==========================================
 # ⭐ TO'LOV STATUSINI FRONTEND DAN QABUL QILISH
 # ==========================================
 
@@ -565,8 +561,7 @@ async def update_payment_status_handler(request):
             "error": str(e)
         }, status=500, headers=get_cors_headers())
 
-# Route qo'shish (main() funksiyasida)
-# app.router.add_post('/api/orders/{order_id}/payment', update_payment_status_handler)
+
 
 async def check_payment_status(order_id: str) -> Dict[str, Any]:
     """
