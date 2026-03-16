@@ -846,10 +846,11 @@ def get_cors_headers():
 
 # OPTIONS handler - MUHIM!
 async def options_handler(request):
-    return web.Response(headers=get_cors_headers())
+    """CORS preflight so'rovlarini qaytarish"""
+    headers = get_cors_headers()
+    headers['Content-Type'] = 'application/json'
+    return web.Response(status=200, headers=headers, body='{}')
 
-# Route larni tekshiring
-app.router.add_options('/api/orders/{order_id}/payment', options_handler)
 # ==========================================
 # TELEGRAM BOT FUNCTIONS
 # ==========================================
