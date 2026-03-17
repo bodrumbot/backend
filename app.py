@@ -488,11 +488,6 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         if conn:
             conn.close()
 
-# ==========================================
-# ⭐ TO'LOV STATUSINI FRONTEND DAN QABUL QILISH
-# ==========================================
-
-
 async def update_payment_status_handler(request):
     """Frontend dan to'lov statusini yangilash - ISHONCHLI"""
     try:
@@ -507,7 +502,7 @@ async def update_payment_status_handler(request):
         transaction_id = data.get('transactionId')
         
         if status == 'paid':
-            # ⭐ ISHONCHLI: avval order mavjudligini tekshirish
+            # ⭐ ISHONCHLI: avval order mavudligini tekshirish
             existing_order = get_order(order_id)
             if not existing_order:
                 return web.json_response({
@@ -525,7 +520,7 @@ async def update_payment_status_handler(request):
                     "already_paid": True
                 }, headers=get_cors_headers())
             
-            # ⭐ MUHIM: to'g'ri status va timestamp
+            # ⭐ MUHIM: to'g'ri status va timestamp - FAQAT 'accepted' qilamiz
             updated = update_order_status(
                 order_id,
                 'accepted',  # 'pending' emas, to'g'ridan-to'g'ri 'accepted'
@@ -694,14 +689,15 @@ async def polling_payment_check(context: ContextTypes.DEFAULT_TYPE):
             if result.get('paid'):
                 logger.info(f"✅ To'lov topildi: {order_id}")
                 
-                # ⭐ FAQAT: Admin va mijozga xabar berish, avtomatik qabul qilish YO'Q!
-                # Status 'pending' qoladi, admin qabul qilishi kerak
+                # ⭐ FAQAT: Admin va mijozga xabar berish, status 'accepted' qilish
                 updated = update_order_status(
                     order_id, 
-                    'pending',  # ⭐ 'accepted' emas, 'pending'!
+                    'accepted',  # ⭐ 'pending' emas, 'accepted'!
                     payment_status='paid',
                     paid_at=datetime.utcnow().isoformat(),
-                    transaction_id=result.get('transaction_id')
+                    accepted_at=datetime.utcnow().isoformat(),  # ⭐ QO'SHILDI
+                    transaction_id=result.get('transaction_id'),
+                    auto_accepted=True
                 )
                 
                 if updated:
@@ -782,8 +778,13 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
         
         items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
         
+        # ⭐ MIJOZ MA'LUMOTLARINI TO'G'RI OLISH
         raw_phone = order.get('phone', '')
         phone_display = format_phone_display(raw_phone)
+        
+        customer_name = order.get('name', 'Mijoz')
+        if not customer_name or customer_name == 'null':
+            customer_name = 'Mijoz'
         
         location = order.get('location')
         location_text = ""
@@ -808,7 +809,7 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
         admin_message = f"""💰 <b>TO'LOV QILINGAN - QABUL QILISH KERAK!</b>
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-👤 Mijoz: {order.get('name')}
+👤 Mijoz: {customer_name}
 📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
 💳 To'lov: PAYME ✅
@@ -1372,8 +1373,14 @@ async def notify_admin_and_customer(order: Dict, is_webapp: bool = False):
         
         items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
         
+        # ⭐ MIJOZ MA'LUMOTLARINI TO'G'RI OLISH
         raw_phone = order.get('phone', '')
         phone_display = format_phone_display(raw_phone)
+        
+        # Ismni to'g'ri olish - agar bo'sh yoki default bo'lsa, "Mijoz" deb qoldirish
+        customer_name = order.get('name', 'Mijoz')
+        if not customer_name or customer_name == 'null' or customer_name == 'undefined':
+            customer_name = 'Mijoz'
         
         location = order.get('location')
         location_text = ""
@@ -1395,13 +1402,13 @@ async def notify_admin_and_customer(order: Dict, is_webapp: bool = False):
         source = order.get('source', 'website')
         source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
         
-        # ⭐ QABUL QILINGAN statusi
+        # ⭐ QABUL QILINGAN statusi - avtomatik yoki qo'lda
         status_text = "⚡ <b>AVTOMATIK QABUL QILINDI</b>" if order.get('auto_accepted') else "✅ <b>QABUL QILINDI</b>"
         
         admin_message = f"""{status_text}
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-👤 Mijoz: {order.get('name')}
+👤 Mijoz: {customer_name}
 📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
 💳 To'lov: PAYME ✅
@@ -1419,7 +1426,7 @@ async def notify_admin_and_customer(order: Dict, is_webapp: bool = False):
         if location_coords and admin_sent:
             send_telegram_location(ADMIN_CHAT_ID_INT, location_coords[0], location_coords[1])
         
-        # Mijozga xabar (faqat WebApp dan bo'lsa)
+        # Mijozga xabar (faqat WebApp dan bo'lsa yoki telefon raqam mavjud bo'lsa)
         if is_webapp:
             tg_id = order.get('tg_id')
             if tg_id:
@@ -1445,10 +1452,6 @@ Tez orada yetkazib beramiz! 🚀
         import traceback
         traceback.print_exc()
         return False
-
-# ==========================================
-# HTTP API HANDLERS - ⭐ PAYME CALLBACK O'CHIRILDI
-# ==========================================
 
 async def health_handler(request):
     return web.json_response({
@@ -1528,7 +1531,7 @@ async def check_payment_handler(request):
         
         # ⭐ ISHONCHLI: transaction_id ham tekshirish
         cur.execute("""
-            SELECT order_id, payment_status, transaction_id, paid_at, status, total, auto_accepted
+            SELECT order_id, payment_status, transaction_id, paid_at, status, total, auto_accepted, name, phone
             FROM orders 
             WHERE order_id = %s
         """, (order_id,))
@@ -1560,6 +1563,8 @@ async def check_payment_handler(request):
             "transaction_id": order.get('transaction_id'),
             "auto_accepted": order.get('auto_accepted', False),
             "amount": order.get('total'),
+            "name": order.get('name'),  # ⭐ QO'SHILDI
+            "phone": order.get('phone'),  # ⭐ QO'SHILDI
             "timestamp": datetime.utcnow().isoformat()
         }
         
