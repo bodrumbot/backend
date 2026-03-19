@@ -710,8 +710,8 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
         # ⭐ FAQAT TO'LOV STATUSINI YANGILASH (avtomatik qabul qilmaydi!)
         updated = update_order_status(
             order_id,
-            order.get('status', 'pending_payment'),  # Status o'zgarmaydi
-            payment_status='paid',  # Faqat to'lov statusi o'zgaradi
+            order.get('status', 'pending_payment'),  # ✅ Status o'zgarmaydi!
+            payment_status='paid',
             transaction_id=receipt_data.get('transaction_id'),
             paid_at=datetime.utcnow().isoformat(),
             payme_receipt_id=receipt_data.get('receipt_id'),
