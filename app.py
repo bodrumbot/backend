@@ -439,7 +439,7 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
             conn.close()
 
 def create_order(data: Dict) -> Optional[Dict]:
-    """Yangi buyurtma yaratish"""
+    """Yangi buyurtma yaratish va admin ga xabar yuborish"""
     conn = None
     try:
         conn = get_db_connection()
@@ -487,6 +487,10 @@ def create_order(data: Dict) -> Optional[Dict]:
             for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
+            
+            # ⭐⭐⭐ YANGI: Admin ga xabar yuborish
+            asyncio.create_task(notify_admin_new_order(order_dict))
+            
             return order_dict
         return None
         
@@ -500,6 +504,113 @@ def create_order(data: Dict) -> Optional[Dict]:
     finally:
         if conn:
             conn.close()
+
+
+async def notify_admin_new_order(order: Dict):
+    """
+    ⭐ YANGI BUYURTMANI ADMIN GA XABAR QILISH
+    """
+    try:
+        logger.info(f"🔔 Yangi buyurtma admin ga xabar: {order.get('order_id')}")
+        
+        if not ADMIN_CHAT_ID_INT:
+            logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
+            return False
+        
+        global application
+        bot = None
+        if application and application.bot:
+            bot = application.bot
+        else:
+            logger.error("❌ Bot mavjud emas!")
+            return False
+        
+        items = order.get('items', [])
+        if isinstance(items, str):
+            items = json.loads(items)
+        
+        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        
+        raw_phone = order.get('phone', '')
+        phone_display = format_phone_display(raw_phone)
+        
+        customer_name = order.get('name', 'Mijoz')
+        if not customer_name or customer_name == 'null':
+            customer_name = 'Mijoz'
+        
+        location = order.get('location')
+        location_text = ""
+        location_coords = None
+        
+        if location and ',' in str(location):
+            try:
+                lat, lng = str(location).split(',')
+                lat = float(lat.strip())
+                lng = float(lng.strip())
+                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+                location_coords = (lat, lng)
+            except Exception as e:
+                logger.warning(f"Joylashuv parse xatosi: {e}")
+                location_text = f"\n📍 <b>Manzil:</b> {location}"
+        elif location:
+            location_text = f"\n📍 <b>Manzil:</b> {location}"
+        
+        source = order.get('source', 'website')
+        source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
+        
+        admin_message = f"""🆕 <b>YANGI BUYURTMA!</b>
+
+🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
+👤 Mijoz: {customer_name}
+📞 Telefon: {phone_display}
+💵 Summa: {format_price(order.get('total', 0))} so'm
+💳 To'lov: {order.get('payment_method', 'payme').upper()} (kutilmoqda)
+📱 Manba: {source_icon}{location_text}
+
+🍽 Mahsulotlar:
+{items_text}
+
+⏰ {datetime.now().strftime('%H:%M:%S')}
+
+<i>💳 Mijoz to'lov qilganda avtomatik qabul qilinadi</i>"""
+
+        # Tugmalar
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
+                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
+            ]
+        ]
+        
+        sent_message = await bot.send_message(
+            chat_id=ADMIN_CHAT_ID_INT,
+            text=admin_message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        
+        # Joylashuvni alohida yuborish
+        if location_coords:
+            try:
+                await bot.send_location(
+                    chat_id=ADMIN_CHAT_ID_INT,
+                    latitude=location_coords[0],
+                    longitude=location_coords[1]
+                )
+            except Exception as e:
+                logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
+        
+        # notified=True qilish
+        update_order_status(order.get('order_id'), order.get('status'), notified=True)
+        
+        logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ notify_admin_new_order xatosi: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[str, Any]]:
     conn = None
@@ -536,9 +647,13 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
             if cur.fetchone():
                 update_data['paid_at'] = kwargs.get('paid_at')
         
+        # ⭐ notified parametri
+        if 'notified' in kwargs:
+            update_data['notified'] = kwargs['notified']
+        
         # Qolgan fieldlar
         for key, val in kwargs.items():
-            if val is not None and key not in ['paid_at']:
+            if val is not None and key not in ['paid_at', 'notified']:
                 update_data[key] = val
         
         fields = []
