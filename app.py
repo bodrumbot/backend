@@ -1,6 +1,6 @@
 # ==========================================
-# BODRUM BOT - FAQAT POLLING TIZIMI
-# PAYME_MERCHANT_ID callback O'CHIRILDI, faqat polling
+# BODRUM BOT - PAYME CHEK PARSER + AUTO ACCEPT
+# Guruhda Payme chekidan buyurtma ID ni o'qib, avtomatik qabul qilish
 # ==========================================
 
 import os
@@ -12,8 +12,9 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 import requests
 import time
+import re
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Chat
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -50,21 +51,23 @@ TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 
+# ⭐ MUHIM: Payme cheklar keladigan guruh ID si
+# Guruh ID si odatda -100 bilan boshlanadi, masalan: -1001234567890
+PAYME_RECEIPTS_GROUP_ID = os.getenv("PAYME_RECEIPTS_GROUP_ID", "")
+
 try:
     ADMIN_CHAT_ID_INT = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else 0
+    PAYME_GROUP_ID_INT = int(PAYME_RECEIPTS_GROUP_ID) if PAYME_RECEIPTS_GROUP_ID else 0
 except ValueError:
-    logger.error(f"❌ ADMIN_CHAT_ID noto'g'ri formatda: {ADMIN_CHAT_ID}")
+    logger.error(f"❌ ADMIN_CHAT_ID yoki PAYME_RECEIPTS_GROUP_ID noto'g'ri formatda")
     ADMIN_CHAT_ID_INT = 0
+    PAYME_GROUP_ID_INT = 0
 
 logger.info(f"🔧 ADMIN_CHAT_ID: {ADMIN_CHAT_ID}, parsed: {ADMIN_CHAT_ID_INT}")
+logger.info(f"🔧 PAYME_RECEIPTS_GROUP_ID: {PAYME_RECEIPTS_GROUP_ID}, parsed: {PAYME_GROUP_ID_INT}")
 
 # Global application
 application = None
-
-# ⭐ POLLING sozlamalari
-POLLING_INTERVAL = 10  # soniyalar
-PENDING_PAYMENTS = {}  # {order_id: {"tg_id": ..., "total": ..., "start_time": ...}}
-MAX_POLLING_MINUTES = 15  # 15 daqiqa kutish
 
 # ==========================================
 # DATABASE FUNCTIONS
@@ -101,7 +104,9 @@ def init_database():
                 transaction_id VARCHAR(100),
                 auto_accepted BOOLEAN DEFAULT FALSE,
                 initiated_from VARCHAR(50) DEFAULT 'website',
-                source VARCHAR(50) DEFAULT 'website'
+                source VARCHAR(50) DEFAULT 'website',
+                payme_receipt_id VARCHAR(100),
+                payme_card_mask VARCHAR(50)
             )
         """)
         
@@ -111,10 +116,12 @@ def init_database():
             ('source', 'VARCHAR(50) DEFAULT \'website\''),
             ('auto_accepted', 'BOOLEAN DEFAULT FALSE'),
             ('transaction_id', 'VARCHAR(100)'),
-            ('paid_at', 'TIMESTAMP'),           # ⭐ QO'SHILDI
-            ('confirmed_at', 'TIMESTAMP'),      # ⭐ QO'SHILDI
-            ('accepted_at', 'TIMESTAMP'),       # ⭐ QO'SHILDI
-            ('rejected_at', 'TIMESTAMP')        # ⭐ QO'SHILDI
+            ('paid_at', 'TIMESTAMP'),
+            ('confirmed_at', 'TIMESTAMP'),
+            ('accepted_at', 'TIMESTAMP'),
+            ('rejected_at', 'TIMESTAMP'),
+            ('payme_receipt_id', 'VARCHAR(100)'),  # ⭐ Payme chek ID si
+            ('payme_card_mask', 'VARCHAR(50)')     # ⭐ Karta maskasi
         ]
         
         for col_name, col_type in columns_to_check:
@@ -148,6 +155,7 @@ def init_database():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_payment_status ON orders(payment_status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_transaction_id ON orders(transaction_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id)")
         
         conn.commit()
@@ -178,7 +186,7 @@ def get_db_connection():
 # TELEGRAM BOT API DIRECT FUNCTIONS
 # ==========================================
 
-def send_telegram_message(chat_id: int, text: str, parse_mode: str = 'HTML') -> bool:
+def send_telegram_message(chat_id: int, text: str, parse_mode: str = 'HTML', reply_markup=None) -> bool:
     """Direct API call to send message"""
     if not TOKEN:
         logger.error("❌ TOKEN not set")
@@ -191,6 +199,9 @@ def send_telegram_message(chat_id: int, text: str, parse_mode: str = 'HTML') -> 
             'text': text,
             'parse_mode': parse_mode
         }
+        if reply_markup:
+            payload['reply_markup'] = json.dumps(reply_markup.to_dict() if hasattr(reply_markup, 'to_dict') else reply_markup)
+        
         response = requests.post(url, json=payload, timeout=10)
         result = response.json()
         
@@ -221,6 +232,79 @@ def send_telegram_location(chat_id: int, latitude: float, longitude: float) -> b
     except Exception as e:
         logger.error(f"❌ send_telegram_location error: {e}")
         return False
+
+# ==========================================
+# PAYME CHEK PARSER
+# ==========================================
+
+def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Payme chek matnidan buyurtma ID va boshqa ma'lumotlarni ajratib olish
+    
+    Namuna:
+    📍 bodrum bot
+    🧾 552
+    👤 OMONOVA NILUFAR
+    💳 561468******0845
+    🇺🇿 1 000,00 сум
+    🔸 Номер заказа: ORD_1773916798067_tvzseftxq
+    🕓 15:40:19 19.03.2026
+    🆔 69bbd27b62b6af0150f6a053
+    ✅ Успешно оплачен
+    """
+    try:
+        if not text or 'bodrum bot' not in text.lower():
+            return None
+        
+        # Buyurtma ID ni topish - ORD_ bilan boshlanadi
+        order_match = re.search(r'ORD_[A-Za-z0-9_]+', text)
+        if not order_match:
+            logger.warning("❌ Buyurtma ID topilmadi chekda")
+            return None
+        
+        order_id = order_match.group(0)
+        
+        # Summa ni topish
+        amount_match = re.search(r'🇺🇿\s*([\d\s,]+)\s*сум', text)
+        amount = 0
+        if amount_match:
+            amount_str = amount_match.group(1).replace(' ', '').replace(',', '.')
+            try:
+                amount = int(float(amount_str))
+            except:
+                pass
+        
+        # Karta maskasi
+        card_match = re.search(r'💳\s*(\d{6}\*+\d{4})', text)
+        card_mask = card_match.group(1) if card_match else None
+        
+        # Payme chek ID si
+        receipt_match = re.search(r'🧾\s*(\d+)', text)
+        receipt_id = receipt_match.group(1) if receipt_match else None
+        
+        # Payme transaction ID
+        trans_match = re.search(r'🆔\s*([a-f0-9]+)', text)
+        transaction_id = trans_match.group(1) if trans_match else None
+        
+        # Mijoz ismi
+        name_match = re.search(r'👤\s*([A-Z\s]+)', text)
+        customer_name = name_match.group(1).strip() if name_match else None
+        
+        logger.info(f"✅ Chek parsed: order_id={order_id}, amount={amount}, card={card_mask}")
+        
+        return {
+            'order_id': order_id,
+            'amount': amount,
+            'card_mask': card_mask,
+            'receipt_id': receipt_id,
+            'transaction_id': transaction_id,
+            'customer_name': customer_name,
+            'raw_text': text
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Chek parse xatosi: {e}")
+        return None
 
 # ==========================================
 # USER PROFILE FUNCTIONS
@@ -425,7 +509,7 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         
         update_data = {'status': status}
         
-        # ⭐ Har bir timestamp ustuni uchun alohida tekshirish
+        # Timestamp fieldlar
         timestamp_fields = {
             'accepted': 'accepted_at',
             'rejected': 'rejected_at', 
@@ -434,7 +518,6 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         
         if status in timestamp_fields:
             field_name = timestamp_fields[status]
-            # Ustun mavjudligini tekshirish
             cur.execute(f"""
                 SELECT column_name 
                 FROM information_schema.columns 
@@ -443,7 +526,7 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
             if cur.fetchone():
                 update_data[field_name] = datetime.utcnow().isoformat()
         
-        # paid_at alohida tekshirish
+        # paid_at alohida
         if kwargs.get('paid_at'):
             cur.execute("""
                 SELECT column_name 
@@ -455,7 +538,7 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         
         # Qolgan fieldlar
         for key, val in kwargs.items():
-            if val is not None and key not in ['paid_at']:  # paid_at alohida qo'shildi
+            if val is not None and key not in ['paid_at']:
                 update_data[key] = val
         
         fields = []
@@ -488,273 +571,78 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         if conn:
             conn.close()
 
-async def update_payment_status_handler(request):
-    """Frontend dan to'lov statusini yangilash - ISHONCHLI"""
-    try:
-        order_id = request.match_info['order_id']
-        
-        logger.info(f"🔔🔔🔔 PAYMENT ENDPOINT: {order_id}")
-        
-        data = await request.json()
-        logger.info(f"📦 Data: {data}")
-        
-        status = data.get('status')
-        transaction_id = data.get('transactionId')
-        
-        if status == 'paid':
-            # ⭐ ISHONCHLI: avval order mavudligini tekshirish
-            existing_order = get_order(order_id)
-            if not existing_order:
-                return web.json_response({
-                    "success": False,
-                    "error": "Order not found"
-                }, status=404, headers=get_cors_headers())
-            
-            # ⭐ ISHONCHLI: agar allaqachon paid bo'lsa, qayta ishlamaslik
-            if existing_order.get('payment_status') == 'paid':
-                logger.info(f"⚠️ Order {order_id} allaqachon paid")
-                return web.json_response({
-                    "success": True,
-                    "order": existing_order,
-                    "message": "Already paid",
-                    "already_paid": True
-                }, headers=get_cors_headers())
-            
-            # ⭐ MUHIM: to'g'ri status va timestamp - FAQAT 'accepted' qilamiz
-            updated = update_order_status(
-                order_id,
-                'accepted',  # 'pending' emas, to'g'ridan-to'g'ri 'accepted'
-                payment_status='paid',
-                transaction_id=transaction_id,
-                paid_at=datetime.utcnow().isoformat(),
-                accepted_at=datetime.utcnow().isoformat(),  # ⭐ QO'SHILDI
-                auto_accepted=True
-            )
-            
-            if updated:
-                # Global dan o'chirish
-                global PENDING_PAYMENTS
-                if order_id in PENDING_PAYMENTS:
-                    del PENDING_PAYMENTS[order_id]
-                
-                # ⭐ ISHONCHLI: async notification
-                asyncio.create_task(notify_admin_and_customer(updated, True))
-                
-                logger.info(f"✅✅✅ BUYURTMA QABUL QILINDI: {order_id}")
-                
-                return web.json_response({
-                    "success": True,
-                    "order": updated,
-                    "message": "To'lov qabul qilindi va buyurtma tasdiqlandi",
-                    "auto_accepted": True
-                }, headers=get_cors_headers())
-        
-        return web.json_response({
-            "success": False,
-            "error": "Invalid status"
-        }, status=400, headers=get_cors_headers())
-        
-    except Exception as e:
-        logger.error(f"❌❌❌ PAYMENT XATOSI: {e}")
-        import traceback
-        traceback.print_exc()
-        return web.json_response({
-            "success": False,
-            "error": str(e)
-        }, status=500, headers=get_cors_headers())
-
-
-async def check_payment_status(order_id: str) -> Dict[str, Any]:
+async def auto_accept_from_receipt(receipt_data: Dict, bot) -> bool:
     """
-    Database dan to'lov statusini tekshirish
+    ⭐ PAYME CHEKDAN BUYURTMANI AVTOMATIK QABUL QILISH
     """
     try:
+        order_id = receipt_data.get('order_id')
+        if not order_id:
+            logger.error("❌ Buyurtma ID yo'q")
+            return False
+        
+        # Buyurtmani topish
         order = get_order(order_id)
         if not order:
-            return {"success": False, "error": "Order not found"}
+            logger.warning(f"⚠️ Buyurtma topilmadi: {order_id}")
+            # Yoki yangi yaratish kerak? Hozircha xatolik
+            return False
         
-        # Database dan tekshirish
-        conn = get_db_connection()
-        cur = conn.cursor()
+        # Agar allaqachon qabul qilingan bo'lsa
+        if order.get('status') == 'accepted' and order.get('payment_status') == 'paid':
+            logger.info(f"⚠️ Buyurtma allaqachon qabul qilingan: {order_id}")
+            return True
         
-        # Ustun mavjudligini tekshirish
-        cur.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'orders' AND column_name = 'paid_at'
-        """)
-        has_paid_at = cur.fetchone() is not None
+        # ⭐ AVTOMATIK QABUL QILISH
+        updated = update_order_status(
+            order_id,
+            'accepted',
+            payment_status='paid',
+            transaction_id=receipt_data.get('transaction_id'),
+            paid_at=datetime.utcnow().isoformat(),
+            accepted_at=datetime.utcnow().isoformat(),
+            auto_accepted=True,
+            payme_receipt_id=receipt_data.get('receipt_id'),
+            payme_card_mask=receipt_data.get('card_mask')
+        )
         
-        if has_paid_at:
-            cur.execute("""
-                SELECT payment_status, transaction_id, paid_at 
-                FROM orders 
-                WHERE order_id = %s
-            """, (order_id,))
-        else:
-            cur.execute("""
-                SELECT payment_status, transaction_id, created_at as paid_at 
-                FROM orders 
-                WHERE order_id = %s
-            """, (order_id,))
-            
-        result = cur.fetchone()
-        cur.close()
-        conn.close()
+        if not updated:
+            logger.error(f"❌ Buyurtma yangilashda xatolik: {order_id}")
+            return False
         
-        if result:
-            # ⭐ MUHIM: transaction_id mavjud bo'lsa yoki payment_status = 'paid' bo'lsa
-            if result['transaction_id'] or result['payment_status'] == 'paid':
-                return {
-                    "success": True,
-                    "paid": True,
-                    "transaction_id": result['transaction_id'],
-                    "paid_at": result['paid_at'].isoformat() if result['paid_at'] else None,
-                    "payment_status": result['payment_status']
-                }
+        logger.info(f"✅✅✅ BUYURTMA AVTOMATIK QABUL QILINDI: {order_id}")
         
-        # Vaqt tekshiruvi
-        created_at = order.get('created_at')
-        if isinstance(created_at, str):
-            created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00').replace('+00:00', ''))
+        # Admin ga xabar
+        await notify_admin_payment_received(updated, True, bot)
         
-        if datetime.utcnow() - created_at > timedelta(minutes=MAX_POLLING_MINUTES):
-            return {"success": True, "paid": False, "expired": True}
+        # Mijozga xabar (agar tg_id bo'lsa)
+        tg_id = order.get('tg_id')
+        if tg_id and bot:
+            try:
+                await bot.send_message(
+                    chat_id=tg_id,
+                    text=f"✅ <b>Buyurtmangiz avtomatik qabul qilindi!</b>\n\n"
+                         f"🆔 Buyurtma: #{order_id[-6:]}\n"
+                         f"💵 Summa: {format_price(updated.get('total', 0))} so'm\n"
+                         f"💳 Karta: {receipt_data.get('card_mask', 'N/A')}\n\n"
+                         f"To'lovingiz muvaffaqiyatli qabul qilindi!\n"
+                         f"Tez orada yetkazib beramiz! 🚀",
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                logger.error(f"Mijozga xabar yuborish xatosi: {e}")
         
-        return {"success": True, "paid": False, "pending": True, "payment_status": result.get('payment_status') if result else 'pending'}
+        return True
         
     except Exception as e:
-        logger.error(f"❌ To'lov tekshiruvi xatosi: {e}")
+        logger.error(f"❌ Auto accept xatosi: {e}")
         import traceback
         traceback.print_exc()
-        return {"success": False, "error": str(e)}
-
-async def polling_payment_check(context: ContextTypes.DEFAULT_TYPE):
-    """
-    ⭐ HAR 10 SONIYADA KUTILAYOTGAN TO'LOVLARNI TEKSHIRISH
-    FAQAT: To'lov qilinganini admin va mijozga xabar berish, avtomatik qabul qilish YO'Q!
-    """
-    global PENDING_PAYMENTS
-    
-    logger.info(f"🔍 Polling tekshiruvi. Kutilayotgan: {len(PENDING_PAYMENTS)}")
-    
-    # ⭐ BOT ni olish
-    bot = context.bot if context else None
-    if bot is None:
-        global application
-        if application and application.bot:
-            bot = application.bot
-    
-    # Database dan ham tekshirish
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM orders 
-            WHERE status = 'pending_payment' 
-            AND created_at > CURRENT_TIMESTAMP - INTERVAL '30 minutes'
-        """)
-        pending_orders = cur.fetchall()
-        cur.close()
-        
-        for row in pending_orders:
-            order = dict(row)
-            order_id = order['order_id']
-            
-            if order_id not in PENDING_PAYMENTS:
-                PENDING_PAYMENTS[order_id] = {
-                    "tg_id": order.get('tg_id'),
-                    "total": order.get('total'),
-                    "start_time": order.get('created_at'),
-                    "checks": 0
-                }
-                
-    except Exception as e:
-        logger.error(f"Database polling xatosi: {e}")
-    finally:
-        if conn:
-            conn.close()
-    
-    # Har bir kutilayotgan to'lovni tekshirish
-    completed_orders = []
-    expired_orders = []
-    
-    for order_id, data in list(PENDING_PAYMENTS.items()):
-        try:
-            data['checks'] = data.get('checks', 0) + 1
-            
-            result = await check_payment_status(order_id)
-            
-            if result.get('paid'):
-                logger.info(f"✅ To'lov topildi: {order_id}")
-                
-                # ⭐ FAQAT: Admin va mijozga xabar berish, status 'accepted' qilish
-                updated = update_order_status(
-                    order_id, 
-                    'accepted',  # ⭐ 'pending' emas, 'accepted'!
-                    payment_status='paid',
-                    paid_at=datetime.utcnow().isoformat(),
-                    accepted_at=datetime.utcnow().isoformat(),  # ⭐ QO'SHILDI
-                    transaction_id=result.get('transaction_id'),
-                    auto_accepted=True
-                )
-                
-                if updated:
-                    # ⭐ BOT ni uzatish
-                    await notify_admin_payment_received(updated, data.get('tg_id') is not None, bot)
-                    
-                    # Mijozga xabar yuborish
-                    if data.get('tg_id') and bot:
-                        try:
-                            await bot.send_message(
-                                chat_id=data['tg_id'],
-                                text=f"✅ <b>To'lovingiz qabul qilindi!</b>\n\n"
-                                     f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                                     f"💵 Summa: {format_price(updated.get('total', 0))} so'm\n\n"
-                                     f"⏳ Buyurtmangiz admin tasdiqlashini kutyapti.\n"
-                                     f"Tez orada qabul qilinadi!",
-                                parse_mode='HTML'
-                            )
-                        except Exception as e:
-                            logger.error(f"Mijozga xabar yuborish xatosi: {e}")
-                    
-                    completed_orders.append(order_id)
-                    
-            elif result.get('expired') or data['checks'] > 90:  # 15 daqiqa
-                logger.info(f"⏰ To'lov muddati tugadi: {order_id}")
-                
-                update_order_status(order_id, 'rejected', payment_status='expired')
-                expired_orders.append(order_id)
-                
-                if data.get('tg_id') and bot:
-                    try:
-                        await bot.send_message(
-                            chat_id=data['tg_id'],
-                            text=f"⏰ <b>Buyurtma bekor qilindi</b>\n\n"
-                                 f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                                 f"💳 To'lov 15 daqiqa ichida amalga oshirilmadi.\n\n"
-                                 f"Qayta buyurtma berish uchun /start ni bosing.",
-                            parse_mode='HTML'
-                        )
-                    except Exception as e:
-                        logger.error(f"Mijozga xabar yuborish xatosi: {e}")
-                        
-        except Exception as e:
-            logger.error(f"Tekshiruv xatosi {order_id}: {e}")
-    
-    # Tozalash
-    for order_id in completed_orders + expired_orders:
-        if order_id in PENDING_PAYMENTS:
-            del PENDING_PAYMENTS[order_id]
-    
-    if completed_orders or expired_orders:
-        logger.info(f"✅ To'lov qilingan: {len(completed_orders)}, ⏰ Tugagan: {len(expired_orders)}")
+        return False
 
 async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bot=None):
     """
     ⭐ ADMIN GA TO'LOV QILINGANLIGI HAQIDA XABAR BERISH
-    (Qabul qilish yoki bekor qilish tugmalari bilan)
     """
     try:
         logger.info(f"🔔 notify_admin_payment_received: {order.get('order_id')}")
@@ -763,7 +651,6 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
             logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
             return False
         
-        # ⭐ BOT ni olish (agar berilmagan bo'lsa global application dan)
         if bot is None:
             global application
             if application and application.bot:
@@ -778,7 +665,6 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
         
         items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
         
-        # ⭐ MIJOZ MA'LUMOTLARINI TO'G'RI OLISH
         raw_phone = order.get('phone', '')
         phone_display = format_phone_display(raw_phone)
         
@@ -803,16 +689,23 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
         elif location:
             location_text = f"\n📍 <b>Manzil:</b> {location}"
         
+        # Payme chek ma'lumotlari
+        receipt_id = order.get('payme_receipt_id', 'N/A')
+        card_mask = order.get('payme_card_mask', 'N/A')
+        
         source = order.get('source', 'website')
         source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
         
-        admin_message = f"""💰 <b>TO'LOV QILINGAN - QABUL QILISH KERAK!</b>
+        status_text = "⚡ <b>AVTOMATIK QABUL QILINDI (PAYME CHEK)</b>"
+        
+        admin_message = f"""{status_text}
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 👤 Mijoz: {customer_name}
 📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: PAYME ✅
+💳 Karta: {card_mask}
+🧾 Chek ID: {receipt_id}
 📱 Manba: {source_icon}{location_text}
 
 🍽 Mahsulotlar:
@@ -820,17 +713,15 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}
 
-<i>⚡ To'lov muvaffaqiyatli - qabul qilish yoki bekor qilish tugmalarini bosing</i>"""
+<i>✅ Payme chek orqali avtomatik qabul qilindi</i>"""
 
-        # ⭐ QABUL QILISH va BEKOR QILISH tugmalari bilan yuborish
+        # Tugmalar - faqat bekor qilish (qabul qilish allaqachon bo'ldi)
         keyboard = [
             [
-                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
                 InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
             ]
         ]
         
-        # ⭐ BOT dan foydalanish
         admin_sent = await bot.send_message(
             chat_id=ADMIN_CHAT_ID_INT,
             text=admin_message,
@@ -839,7 +730,6 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
         )
         
         if location_coords and admin_sent:
-            # Joylashuvni alohida yuborish
             try:
                 await bot.send_location(
                     chat_id=ADMIN_CHAT_ID_INT,
@@ -861,11 +751,10 @@ def get_cors_headers():
     return {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': '*',  # ⭐ BARCHA headerlar ruxsat etiladi
+        'Access-Control-Allow-Headers': '*',
         'Access-Control-Max-Age': '86400',
     }
 
-# OPTIONS handler - MUHIM!
 async def options_handler(request):
     """CORS preflight so'rovlarini qaytarish"""
     return web.Response(
@@ -945,8 +834,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
-
-
 async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Contact qabul qilish"""
     user = update.effective_user
@@ -1000,10 +887,8 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
-
-
 async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Yangi buyurtmalar ro'yxatini ko'rsatish - FAQAT TO'LOV QILINGANLAR"""
+    """Yangi buyurtmalar ro'yxatini ko'rsatish"""
     query = update.callback_query
     await query.answer()
     
@@ -1011,7 +896,6 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # ⭐ FAQAT to'lov qilingan va qabul qilinmagan buyurtmalar
         cur.execute("""
             SELECT * FROM orders 
             WHERE payment_status = 'paid' 
@@ -1066,8 +950,6 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
                 location_coords = (lat, lng)
             except:
                 pass
-        
-        # ⭐ OLIB TASHLANDI: source_text qismi
         
         message = f"""🛎️ <b>YANGI TO'LOV QILINGAN BUYURTMA!</b>
 
@@ -1198,6 +1080,51 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Message edit error: {e}")
                 await context.bot.send_message(chat_id=user.id, text="❌ Xatolik yuz berdi!")
 
+# ⭐⭐⭐ YANGI: PAYME CHEK HANDLER
+async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    ⭐ Payme cheklar keladigan guruhda xabarlarni ushlash
+    """
+    message = update.message
+    if not message or not message.text:
+        return
+    
+    # Faqat belgilangan guruhda ishlaydi
+    chat_id = message.chat_id
+    if PAYME_GROUP_ID_INT and chat_id != PAYME_GROUP_ID_INT:
+        logger.debug(f"⏭️ Boshqa guruh: {chat_id}, kerakli: {PAYME_GROUP_ID_INT}")
+        return
+    
+    text = message.text
+    logger.info(f"📩 Guruh xabari: {text[:100]}...")
+    
+    # Payme chek ekanligini tekshirish
+    if 'bodrum bot' not in text.lower() and 'номер заказа' not in text.lower():
+        return
+    
+    # Chekni parse qilish
+    receipt_data = parse_payme_receipt(text)
+    if not receipt_data:
+        logger.warning("❌ Chek parse qilinmadi")
+        return
+    
+    logger.info(f"✅ Chek parsed: {receipt_data}")
+    
+    # Avtomatik qabul qilish
+    success = await auto_accept_from_receipt(receipt_data, context.bot)
+    
+    if success:
+        # Guruhga tasdiq xabari (ixtiyoriy)
+        try:
+            await message.reply_text(
+                f"✅ Buyurtma #{receipt_data['order_id'][-6:]} avtomatik qabul qilindi!",
+                quote=True
+            )
+        except Exception as e:
+            logger.warning(f"Guruhga javob yuborishda xato: {e}")
+    else:
+        logger.error(f"❌ Auto accept muvaffaqiyatsiz: {receipt_data['order_id']}")
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Statistika ko'rsatish"""
     user = update.effective_user
@@ -1231,9 +1158,6 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_count = total_result['count']
         total_sum = total_result['coalesce'] or 0
         
-        global PENDING_PAYMENTS
-        polling_count = len(PENDING_PAYMENTS)
-        
         cur.close()
         conn.close()
         
@@ -1245,7 +1169,6 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ⏳ <b>Kutilayotgan:</b>
 • Yangi buyurtmalar: {new_count} ta
-• Polling tekshiruvida: {polling_count} ta
 
 📈 <b>Jami:</b>
 • Qabul qilingan: {total_count} ta
@@ -1358,108 +1281,13 @@ async def show_user_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, o
             parse_mode='HTML'
         )
 
-async def notify_admin_and_customer(order: Dict, is_webapp: bool = False):
-    """Admin va mijozga qabul qilinganligi haqida xabar yuborish"""
-    try:
-        logger.info(f"🔔 notify_admin_and_customer: {order.get('order_id')}, is_webapp: {is_webapp}")
-        
-        if not ADMIN_CHAT_ID_INT:
-            logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
-            return False
-        
-        items = order.get('items', [])
-        if isinstance(items, str):
-            items = json.loads(items)
-        
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-        
-        # ⭐ MIJOZ MA'LUMOTLARINI TO'G'RI OLISH
-        raw_phone = order.get('phone', '')
-        phone_display = format_phone_display(raw_phone)
-        
-        # Ismni to'g'ri olish - agar bo'sh yoki default bo'lsa, "Mijoz" deb qoldirish
-        customer_name = order.get('name', 'Mijoz')
-        if not customer_name or customer_name == 'null' or customer_name == 'undefined':
-            customer_name = 'Mijoz'
-        
-        location = order.get('location')
-        location_text = ""
-        location_coords = None
-        
-        if location and ',' in str(location):
-            try:
-                lat, lng = str(location).split(',')
-                lat = float(lat.strip())
-                lng = float(lng.strip())
-                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
-                location_coords = (lat, lng)
-            except Exception as e:
-                logger.warning(f"Joylashuv parse xatosi: {e}")
-                location_text = f"\n📍 <b>Manzil:</b> {location}"
-        elif location:
-            location_text = f"\n📍 <b>Manzil:</b> {location}"
-        
-        source = order.get('source', 'website')
-        source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
-        
-        # ⭐ QABUL QILINGAN statusi - avtomatik yoki qo'lda
-        status_text = "⚡ <b>AVTOMATIK QABUL QILINDI</b>" if order.get('auto_accepted') else "✅ <b>QABUL QILINDI</b>"
-        
-        admin_message = f"""{status_text}
-
-🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-👤 Mijoz: {customer_name}
-📞 Telefon: {phone_display}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: PAYME ✅
-📱 Manba: {source_icon}{location_text}
-
-🍽 Mahsulotlar:
-{items_text}
-
-⏰ {datetime.now().strftime('%H:%M:%S')}
-
-<i>✅ Buyurtma muvaffaqiyatli qabul qilindi</i>"""
-
-        admin_sent = send_telegram_message(ADMIN_CHAT_ID_INT, admin_message)
-        
-        if location_coords and admin_sent:
-            send_telegram_location(ADMIN_CHAT_ID_INT, location_coords[0], location_coords[1])
-        
-        # Mijozga xabar (faqat WebApp dan bo'lsa yoki telefon raqam mavjud bo'lsa)
-        if is_webapp:
-            tg_id = order.get('tg_id')
-            if tg_id:
-                customer_message = f"""✅ <b>Buyurtmangiz avtomatik qabul qilindi!</b>
-
-🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: Payme ✅
-
-Buyurtmangiz to'lov qilingani uchun avtomatik qabul qilindi!
-
-Tez orada yetkazib beramiz! 🚀
-
-⏰ {datetime.now().strftime('%H:%M:%S')}"""
-                
-                send_telegram_message(int(tg_id), customer_message)
-                logger.info(f"✅ Mijozga xabar yuborildi: {tg_id}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ notify_admin_and_customer xatosi: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
 async def health_handler(request):
     return web.json_response({
         "status": "ok", 
         "service": "bodrum-bot",
         "timestamp": datetime.utcnow().isoformat(),
-        "polling_active": True,
-        "pending_payments": len(PENDING_PAYMENTS)
+        "payme_receipt_parser": "enabled",
+        "auto_accept": "enabled"
     }, headers=get_cors_headers())
 
 async def create_order_handler(request):
@@ -1475,19 +1303,10 @@ async def create_order_handler(request):
         order = create_order(data)
         
         if order:
-            global PENDING_PAYMENTS
-            PENDING_PAYMENTS[order['order_id']] = {
-                "tg_id": data.get('tgId') or data.get('tg_id'),
-                "total": data.get('total'),
-                "start_time": datetime.utcnow().isoformat(),
-                "checks": 0
-            }
-            
-            logger.info(f"✅ Buyurtma yaratildi va polling ga qo'shildi: {order['order_id']}")
+            logger.info(f"✅ Buyurtma yaratildi: {order['order_id']}")
             return web.json_response({
                 **order,
-                "polling_started": True,
-                "message": "Buyurtma yaratildi. To'lov 15 daqiqa ichida amalga oshirilishi kerak."
+                "message": "Buyurtma yaratildi. To'lov qilinganda avtomatik qabul qilinadi."
             }, status=201, headers=get_cors_headers())
         else:
             return web.json_response({"error": "Failed to create order"}, status=500, headers=get_cors_headers())
@@ -1506,77 +1325,10 @@ async def get_order_handler(request):
         if not order:
             return web.json_response({"error": "Not found"}, status=404, headers=get_cors_headers())
         
-        global PENDING_PAYMENTS
-        polling_info = PENDING_PAYMENTS.get(order_id, {})
-        
-        return web.json_response({
-            **order,
-            "polling_status": {
-                "active": order_id in PENDING_PAYMENTS,
-                "checks": polling_info.get('checks', 0),
-                "elapsed_minutes": polling_info.get('elapsed_minutes', 0)
-            }
-        }, headers=get_cors_headers())
+        return web.json_response(order, headers=get_cors_headers())
     except Exception as e:
         logger.error(f"API get order error: {e}")
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
-
-async def check_payment_handler(request):
-    """⭐ ISHONCHLI POLLING - Database dan tekshirish"""
-    try:
-        order_id = request.match_info['order_id']
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # ⭐ ISHONCHLI: transaction_id ham tekshirish
-        cur.execute("""
-            SELECT order_id, payment_status, transaction_id, paid_at, status, total, auto_accepted, name, phone
-            FROM orders 
-            WHERE order_id = %s
-        """, (order_id,))
-        
-        result = cur.fetchone()
-        cur.close()
-        conn.close()
-        
-        if not result:
-            return web.json_response({
-                "success": False,
-                "error": "Order not found"
-            }, status=404, headers=get_cors_headers())
-        
-        order = dict(result)
-        
-        # ⭐ ISHONCHLI: transaction_id mavjudligini ham tekshirish
-        is_paid = (
-            order.get('payment_status') == 'paid' or 
-            order.get('transaction_id') is not None or
-            order.get('status') == 'accepted'
-        )
-        
-        response = {
-            "success": True,
-            "paid": is_paid,
-            "payment_status": order.get('payment_status'),
-            "status": order.get('status'),
-            "transaction_id": order.get('transaction_id'),
-            "auto_accepted": order.get('auto_accepted', False),
-            "amount": order.get('total'),
-            "name": order.get('name'),  # ⭐ QO'SHILDI
-            "phone": order.get('phone'),  # ⭐ QO'SHILDI
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-        logger.info(f"🔍 Polling {order_id}: paid={is_paid}")
-        return web.json_response(response, headers=get_cors_headers())
-        
-    except Exception as e:
-        logger.error(f"Check payment error: {e}")
-        return web.json_response({
-            "success": False,
-            "error": str(e)
-        }, status=500, headers=get_cors_headers())
 
 async def orders_list_handler(request):
     """Barcha buyurtmalarni olish - FAQAT QABUL QILINGANLAR"""
@@ -1761,9 +1513,6 @@ async def get_user_profile_api(request):
             "error": str(e)
         }, status=500, headers=get_cors_headers())
 
-async def options_handler(request):
-    return web.Response(headers=get_cors_headers())
-
 async def webhook_handler(request):
     global application
     
@@ -1776,8 +1525,6 @@ async def webhook_handler(request):
             logger.error(f"Webhook processing error: {e}")
     
     return web.Response(text='OK')
-
-# ⭐ PAYME CALLBACK HANDLER O'CHIRILDI - FAQAT POLLING ISHLATILADI
 
 # ==========================================
 # MAIN
@@ -1802,28 +1549,19 @@ async def init_webhook(app):
     
     application = Application.builder().token(TOKEN).build()
     
-    # ⭐ POLLING JOBS - HAR 10 SONIYADA
-    job_queue = application.job_queue
-    
-    job_queue.run_repeating(
-        polling_payment_check,
-        interval=POLLING_INTERVAL,
-        first=5,
-        name="payment_polling"
-    )
-    
-    job_queue.run_repeating(
-        lambda ctx: asyncio.create_task(cleanup_old_payments()),
-        interval=60,
-        first=30,
-        name="cleanup_old"
-    )
-    
     # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("myorders", myorders_command))
     
+    # ⭐⭐⭐ YANGI: Payme chek handler (guruh uchun)
+    # Guruhda xabarlar uchun
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.GROUPS & filters.Regex(r'bodrum bot|Номер заказа|ORD_'),
+        payme_receipt_handler
+    ))
+    
+    # Shaxsiy chatlar uchun
     application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     
@@ -1838,29 +1576,9 @@ async def init_webhook(app):
         except Exception as e:
             logger.error(f"❌ Webhook xato: {e}")
     
-    logger.info(f"🤖 Bot ishga tushdi! ADMIN_CHAT_ID: {ADMIN_CHAT_ID_INT}")
-    logger.info(f"⏰ Polling har {POLLING_INTERVAL} soniyada ishga tushadi")
-
-async def cleanup_old_payments():
-    """Eski to'lovlarni tozalash"""
-    global PENDING_PAYMENTS
-    current_time = datetime.utcnow()
-    to_remove = []
-    
-    for order_id, data in PENDING_PAYMENTS.items():
-        try:
-            start_time = data.get('start_time')
-            if isinstance(start_time, str):
-                start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00').replace('+00:00', ''))
-            
-            if (current_time - start_time).total_seconds() > 1800:
-                to_remove.append(order_id)
-        except:
-            pass
-    
-    for order_id in to_remove:
-        del PENDING_PAYMENTS[order_id]
-        logger.info(f"🧹 Eski to'lov o'chirildi: {order_id}")
+    logger.info(f"🤖 Bot ishga tushdi!")
+    logger.info(f"💳 Payme chek parser faol: Guruh ID = {PAYME_GROUP_ID_INT}")
+    logger.info(f"⚡ Auto accept faol: To'lov qilingan buyurtmalar avtomatik qabul qilinadi")
 
 async def shutdown(app):
     global application
@@ -1874,7 +1592,7 @@ async def shutdown(app):
 
 def main():
     logger.info("🔧 Bodrum Bot starting...")
-    logger.info("⏰ FAQAT POLLING tizimi faollashdi! Payme callback O'CHIRILDI")
+    logger.info("💳 Payme chek parser + Auto accept tizimi faollashdi!")
     
     if not PORT:
         logger.error("❌ PORT o'rnatilmagan!")
@@ -1882,10 +1600,9 @@ def main():
     
     app = web.Application()
     
-    # ⭐ GLOBAL CORS MIDDLEWARE
+    # CORS middleware
     async def cors_middleware(app, handler):
         async def middleware_handler(request):
-            # OPTIONS so'rovlariga darhol javob
             if request.method == 'OPTIONS':
                 return web.Response(
                     status=200,
@@ -1897,10 +1614,7 @@ def main():
                     }
                 )
             
-            # Asosiy so'rovni ishga tushirish
             response = await handler(request)
-            
-            # CORS headerlarini qo'shish
             response.headers['Access-Control-Allow-Origin'] = '*'
             response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
             response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With, Cache-Control, Pragma, Accept'
@@ -1909,7 +1623,6 @@ def main():
         
         return middleware_handler
     
-    # Middleware ni qo'shish
     app.middlewares.append(cors_middleware)
     
     # Routes
@@ -1922,10 +1635,6 @@ def main():
     app.router.add_post('/api/orders', create_order_handler)
     app.router.add_get('/api/orders/{order_id}', get_order_handler)
     app.router.add_put('/api/orders/{order_id}', update_order_handler)
-    app.router.add_post('/api/orders/{order_id}/payment', update_payment_status_handler)
-    
-    # ⭐ POLLING API
-    app.router.add_get('/api/orders/{order_id}/payment-status', check_payment_handler)
     
     # User profile API
     app.router.add_post('/api/user/profile', get_user_profile_api)
@@ -1938,8 +1647,8 @@ def main():
     app.on_cleanup.append(shutdown)
     
     logger.info(f"🚀 Server ishga tushmoqda: 0.0.0.0:{PORT}")
-    logger.info(f"⏰ Polling interval: {POLLING_INTERVAL} soniya")
-    logger.info("❌ Payme callback o'chirildi - faqat polling ishlatiladi")
+    logger.info(f"💳 Payme chek parser: Faol")
+    logger.info(f"⚡ Auto accept: Faol")
     
     web.run_app(app, host='0.0.0.0', port=PORT)
 
