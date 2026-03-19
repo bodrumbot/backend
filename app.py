@@ -775,14 +775,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"🚀 /start - User: {user.id}, Admin: {is_admin}")
     
     if is_admin:
-        # ⭐ TO'G'RILANGAN: web_app buttonlari InlineKeyboardMarkup da ishlamaydi
-        # Ularni alohida yuborish yoki URL button qilish kerak
         keyboard = [
             [InlineKeyboardButton("🛎️ Yangi buyurtmalar", callback_data="show_new_orders")],
             [InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")],
-            # ⭐ URL button - WebApp o'rniga oddiy URL
-            [InlineKeyboardButton("🍽️ Menyu ko'rish", url=WEBAPP_URL)],
-            [InlineKeyboardButton("⚙️ Admin Panel", url=f"{WEBAPP_URL}/admin.html")]
+            [InlineKeyboardButton("🍽️ Menyu ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))],
+            [InlineKeyboardButton("⚙️ Admin Panel", web_app=WebAppInfo(url=f"{WEBAPP_URL}/admin.html"))]
         ]
         
         welcome_text = f"""👋 <b>Salom, Admin {user.first_name}!</b>
