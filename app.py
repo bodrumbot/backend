@@ -686,9 +686,9 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         if conn:
             conn.close()
 
-async def auto_accept_from_receipt(receipt_data: Dict, bot) -> bool:
+async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
     """
-    ⭐ PAYME CHEKDAN BUYURTMANI AVTOMATIK QABUL QILISH
+    ⭐ PAYME CHEK KELGANDA: Avtomatik qabul qilmasdan, admin ga xabar yuborish
     """
     try:
         order_id = receipt_data.get('order_id')
@@ -700,23 +700,20 @@ async def auto_accept_from_receipt(receipt_data: Dict, bot) -> bool:
         order = get_order(order_id)
         if not order:
             logger.warning(f"⚠️ Buyurtma topilmadi: {order_id}")
-            # Yoki yangi yaratish kerak? Hozircha xatolik
             return False
         
         # Agar allaqachon qabul qilingan bo'lsa
-        if order.get('status') == 'accepted' and order.get('payment_status') == 'paid':
+        if order.get('status') == 'accepted':
             logger.info(f"⚠️ Buyurtma allaqachon qabul qilingan: {order_id}")
             return True
         
-        # ⭐ AVTOMATIK QABUL QILISH
+        # ⭐ FAQAT TO'LOV STATUSINI YANGILASH (avtomatik qabul qilmaydi!)
         updated = update_order_status(
             order_id,
-            'accepted',
-            payment_status='paid',
+            order.get('status', 'pending_payment'),  # Status o'zgarmaydi
+            payment_status='paid',  # Faqat to'lov statusi o'zgaradi
             transaction_id=receipt_data.get('transaction_id'),
             paid_at=datetime.utcnow().isoformat(),
-            accepted_at=datetime.utcnow().isoformat(),
-            auto_accepted=True,
             payme_receipt_id=receipt_data.get('receipt_id'),
             payme_card_mask=receipt_data.get('card_mask')
         )
@@ -725,23 +722,23 @@ async def auto_accept_from_receipt(receipt_data: Dict, bot) -> bool:
             logger.error(f"❌ Buyurtma yangilashda xatolik: {order_id}")
             return False
         
-        logger.info(f"✅✅✅ BUYURTMA AVTOMATIK QABUL QILINDI: {order_id}")
+        logger.info(f"✅ To'lov qabul qilindi (qo'lda tasdiqlash kutilmoqda): {order_id}")
+
+        # ⭐ ADMIN GA XABAR YUBORISH (qo'lda qabul qilish uchun)
+        await notify_admin_payment_received(updated, bot)
         
-        # Admin ga xabar
-        await notify_admin_payment_received(updated, True, bot)
-        
-        # Mijozga xabar (agar tg_id bo'lsa)
+        # Mijozga xabar
         tg_id = order.get('tg_id')
         if tg_id and bot:
             try:
                 await bot.send_message(
                     chat_id=tg_id,
-                    text=f"✅ <b>Buyurtmangiz avtomatik qabul qilindi!</b>\n\n"
+                    text=f"✅ <b>To'lovingiz qabul qilindi!</b>\n\n"
                          f"🆔 Buyurtma: #{order_id[-6:]}\n"
                          f"💵 Summa: {format_price(updated.get('total', 0))} so'm\n"
                          f"💳 Karta: {receipt_data.get('card_mask', 'N/A')}\n\n"
-                         f"To'lovingiz muvaffaqiyatli qabul qilindi!\n"
-                         f"Tez orada yetkazib beramiz! 🚀",
+                         f"⏳ Buyurtmangiz admin tasdig'ini kutyapti...\n"
+                         f"Tez orada qabul qililadi! 🚀",
                     parse_mode='HTML'
                 )
             except Exception as e:
@@ -750,14 +747,14 @@ async def auto_accept_from_receipt(receipt_data: Dict, bot) -> bool:
         return True
         
     except Exception as e:
-        logger.error(f"❌ Auto accept xatosi: {e}")
+        logger.error(f"❌ Process receipt xatosi: {e}")
         import traceback
         traceback.print_exc()
         return False
 
-async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bot=None):
+async def notify_admin_payment_received(order: Dict, bot=None):
     """
-    ⭐ ADMIN GA TO'LOV QILINGANLIGI HAQIDA XABAR BERISH
+    ⭐ ADMIN GA TO'LOV QILINGANLIGI HAQIDA XABAR (qo'lda qabul qilish uchun)
     """
     try:
         logger.info(f"🔔 notify_admin_payment_received: {order.get('order_id')}")
@@ -804,14 +801,14 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
         elif location:
             location_text = f"\n📍 <b>Manzil:</b> {location}"
         
-        # Payme chek ma'lumotlari
         receipt_id = order.get('payme_receipt_id', 'N/A')
         card_mask = order.get('payme_card_mask', 'N/A')
         
         source = order.get('source', 'website')
         source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
         
-        status_text = "⚡ <b>AVTOMATIK QABUL QILINDI (PAYME CHEK)</b>"
+        # ⭐ MUHIM: Endi "AVTOMATIK" emas, "QABUL QILISH KERAK"
+        status_text = "💳 <b>TO'LOV QILINDI - QABUL QILISH KERAK!</b>"
         
         admin_message = f"""{status_text}
 
@@ -828,11 +825,12 @@ async def notify_admin_payment_received(order: Dict, is_webapp: bool = False, bo
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}
 
-<i>✅ Payme chek orqali avtomatik qabul qilindi</i>"""
+<i>⚡ To'lov muvaffaqiyatli! Buyurtmani qabul qiling yoki bekor qiling</i>"""
 
-        # Tugmalar - faqat bekor qilish (qabul qilish allaqachon bo'ldi)
+        # ⭐ TUGMALAR - Admin qo'lda bosishi uchun
         keyboard = [
             [
+                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
                 InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
             ]
         ]
@@ -1226,7 +1224,7 @@ async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TY
     logger.info(f"✅ Chek parsed: {receipt_data}")
     
     # Avtomatik qabul qilish
-    success = await auto_accept_from_receipt(receipt_data, context.bot)
+    success = await process_payme_receipt(receipt_data, context.bot)
     
     if success:
         # Guruhga tasdiq xabari (ixtiyoriy)
