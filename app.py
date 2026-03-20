@@ -266,7 +266,7 @@ def send_telegram_location(chat_id: int, latitude: float, longitude: float) -> b
 # ==========================================
 
 def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
-    """Payme chek parse - faqat ORDER ID ni tekshiradi"""
+    """Payme chek parse - faqat ORDER ID ni tekshiradi (case insensitive)"""
     try:
         if not text:
             return None
@@ -275,7 +275,7 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
         # Katta-kichik harf farqi yo'q
         text_lower = text.lower()
         
-        # Tekshirish: "номер заказа" yoki "order" so'zlari bormi
+        # Tekshirish: "номер заказа" yoki "order" so'zlari bormi?
         has_order_marker = 'номер заказа' in text_lower or 'order' in text_lower
         
         if not has_order_marker:
@@ -283,20 +283,21 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
             return None
         
         # 2. Faqat ORDER ID ni olish - eng muhim qism
-        # Format: ORD_1234567890_abcdefgh
-        order_match = re.search(r'ORD_[A-Za-z0-9_]+', text)
+        # Format: ORD_1234567890_abcdefgh (case insensitive)
+        order_match = re.search(r'ORD_[A-Za-z0-9_]+', text, re.IGNORECASE)
         if not order_match:
             logger.warning("❌ ORDER ID pattern topilmadi")
             return None
         
-        order_id = order_match.group(0).upper()  # Katta harfga o'tkazish
+        # ⭐ MUHIM: Order ID ni ASL HOLIDA saqlash (case ni o'zgartirmaymiz!)
+        order_id = order_match.group(0)  # .upper() OLIB TASHLANDI!
         
         logger.info(f"✅ ORDER ID topildi: {order_id}")
         
         # 3. Summa (agar bo'lsa)
         amount = 0
         # Format: 🇺🇿 1 000,00 сум
-        amount_match = re.search(r'🇺🇿\s*([\d\s,]+)\s*сум', text, re.IGNORECASE)
+        amount_match = re.search(r'🇺🇿\\s*([\\d\\s,]+)\\s*сум', text, re.IGNORECASE)
         if amount_match:
             amount_str = amount_match.group(1).replace(' ', '').replace(',', '.')
             try:
@@ -305,23 +306,23 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
                 pass
         
         # 4. Mijoz ismi (agar bo'lsa)
-        name_match = re.search(r'👤\s*([А-Яа-яЁёA-Za-z\s]+)', text)
+        name_match = re.search(r'👤\\s*([А-Яа-яЁёA-Za-z\\s]+)', text)
         customer_name = name_match.group(1).strip() if name_match else None
         
         # 5. Transaction ID (agar bo'lsa)
-        trans_match = re.search(r'🆔\s*([a-f0-9]+)', text, re.IGNORECASE)
+        trans_match = re.search(r'🆔\\s*([a-f0-9]+)', text, re.IGNORECASE)
         transaction_id = trans_match.group(1) if trans_match else None
         
         # 6. Chek ID (agar bo'lsa)
-        receipt_match = re.search(r'🧾\s*(\d+)', text)
+        receipt_match = re.search(r'🧾\\s*(\\d+)', text)
         receipt_id = receipt_match.group(1) if receipt_match else None
         
         # 7. Karta maskasi (agar bo'lsa)
-        card_match = re.search(r'💳\s*(\d{6}[*\s]+\d{4})', text)
+        card_match = re.search(r'💳\\s*(\\d{6}[*\\s]+\\d{4})', text)
         card_mask = card_match.group(1).replace(' ', '') if card_match else None
         
         result = {
-            'order_id': order_id,
+            'order_id': order_id,  # Asl case da saqlanadi
             'amount': amount,
             'card_mask': card_mask,
             'receipt_id': receipt_id,
@@ -1378,18 +1379,34 @@ async def create_order_handler(request):
         traceback.print_exc()
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
-async def get_order_handler(request):
+def get_order(order_id: str) -> Optional[Dict[str, Any]]:
+    """Buyurtmani olish - CASE INSENSITIVE"""
+    conn = None
     try:
-        order_id = request.match_info['order_id']
-        order = get_order(order_id)
+        conn = get_db_connection()
+        cur = conn.cursor()
         
-        if not order:
-            return web.json_response({"error": "Not found"}, status=404, headers=get_cors_headers())
+        # ⭐ CASE INSENSITIVE qidirish - ILIKE ishlatamiz
+        cur.execute(
+            "SELECT * FROM orders WHERE order_id ILIKE %s", 
+            (order_id,)
+        )
+        result = cur.fetchone()
+        cur.close()
         
-        return web.json_response(order, headers=get_cors_headers())
+        if result:
+            order_dict = dict(result)
+            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
+                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
+                    order_dict[key] = order_dict[key].isoformat()
+            return order_dict
+        return None
     except Exception as e:
-        logger.error(f"API get order error: {e}")
-        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+        logger.error(f"Get order error: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 async def orders_list_handler(request):
     """Barcha buyurtmalarni olish - FAQAT QABUL QILINGANLAR"""
