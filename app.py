@@ -584,11 +584,17 @@ def format_phone_display(phone: str) -> str:
     return f"+998{phone}"
 
 def get_order(order_id: str) -> Optional[Dict[str, Any]]:
+    """Buyurtmani olish - CASE INSENSITIVE"""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+        
+        # ⭐ CASE INSENSITIVE qidirish - ILIKE ishlatamiz
+        cur.execute(
+            "SELECT * FROM orders WHERE order_id ILIKE %s", 
+            (order_id,)
+        )
         result = cur.fetchone()
         cur.close()
         
@@ -1379,34 +1385,18 @@ async def create_order_handler(request):
         traceback.print_exc()
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
-def get_order(order_id: str) -> Optional[Dict[str, Any]]:
-    """Buyurtmani olish - CASE INSENSITIVE"""
-    conn = None
+async def get_order_handler(request):
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        order_id = request.match_info['order_id']
+        order = get_order(order_id)
         
-        # ⭐ CASE INSENSITIVE qidirish - ILIKE ishlatamiz
-        cur.execute(
-            "SELECT * FROM orders WHERE order_id ILIKE %s", 
-            (order_id,)
-        )
-        result = cur.fetchone()
-        cur.close()
+        if not order:
+            return web.json_response({"error": "Not found"}, status=404, headers=get_cors_headers())
         
-        if result:
-            order_dict = dict(result)
-            for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
-                if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
-                    order_dict[key] = order_dict[key].isoformat()
-            return order_dict
-        return None
+        return web.json_response(order, headers=get_cors_headers())
     except Exception as e:
-        logger.error(f"Get order error: {e}")
-        return None
-    finally:
-        if conn:
-            conn.close()
+        logger.error(f"API get order error: {e}")
+        return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
 async def orders_list_handler(request):
     """Barcha buyurtmalarni olish - FAQAT QABUL QILINGANLAR"""
