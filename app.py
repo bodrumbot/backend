@@ -254,84 +254,71 @@ def send_telegram_location(chat_id: int, latitude: float, longitude: float) -> b
         return False
 
 # ==========================================
-# PAYME CHEK PARSER - TO'G'RILANGAN
-# ==========================================
-
-# ==========================================
-# PAYME CHEK PARSER - TO'G'RILANGAN
-# ==========================================
-
-# ==========================================
-# PAYME CHEK PARSER - FAQAT ORDER ID TEKSHIRISH
+# PAYME CHEK PARSER - FAQAT ORDER ID
 # ==========================================
 
 def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
-    """Payme chek parse - faqat ORDER ID ni tekshiradi (case insensitive)"""
+    """Payme chek parse - faqat ORDER ID ni oladi, qolganini ignore qiladi"""
     try:
         if not text:
             return None
         
-        # 1. "Номер заказа:" yoki "Order ID:" qidirish
-        # Katta-kichik harf farqi yo'q
-        text_lower = text.lower()
-        
-        # Tekshirish: "номер заказа" yoki "order" so'zlari bormi?
-        has_order_marker = 'номер заказа' in text_lower or 'order' in text_lower
-        
-        if not has_order_marker:
-            logger.debug(f"⏭️ 'Номер заказа' yoki 'order' topilmadi")
-            return None
-        
-        # 2. Faqat ORDER ID ni olish - eng muhim qism
+        # Faqat ORD_ patternini qidirish - eng muhim qism
         # Format: ORD_1234567890_abcdefgh (case insensitive)
         order_match = re.search(r'ORD_[A-Za-z0-9_]+', text, re.IGNORECASE)
+        
         if not order_match:
-            logger.warning("❌ ORDER ID pattern topilmadi")
+            logger.debug("❌ ORDER ID pattern topilmadi")
             return None
         
-        # ⭐ MUHIM: Order ID ni ASL HOLIDA saqlash (case ni o'zgartirmaymiz!)
-        order_id = order_match.group(0)  # .upper() OLIB TASHLANDI!
+        # Order ID ni olamiz (asl holida)
+        order_id = order_match.group(0)
         
         logger.info(f"✅ ORDER ID topildi: {order_id}")
         
-        # 3. Summa (agar bo'lsa)
+        # Qolgan ma'lumotlarni ham olishga harakat qilamiz (agar bo'lsa)
+        # Agar regex ishlamasa ham, order_id ni qaytaramiz
+        
+        # Summa (ixtiyoriy)
         amount = 0
-        # Format: 🇺🇿 1 000,00 сум
-        amount_match = re.search(r'🇺🇿\\s*([\\d\\s,]+)\\s*сум', text, re.IGNORECASE)
-        if amount_match:
-            amount_str = amount_match.group(1).replace(' ', '').replace(',', '.')
-            try:
+        try:
+            # 🇺🇿 1 000,00 сум yoki 1 000,00 so'm
+            amount_match = re.search(r'[\d\s,]+\s*(?:сум|so\'m|s\'om)', text, re.IGNORECASE)
+            if amount_match:
+                amount_str = amount_match.group(0).replace('сум', '').replace('so\'m', '').replace('s\'om', '').replace(' ', '').replace(',', '.').strip()
                 amount = int(float(amount_str))
-            except:
-                pass
+        except:
+            pass
         
-        # 4. Mijoz ismi (agar bo'lsa)
-        name_match = re.search(r'👤\\s*([А-Яа-яЁёA-Za-z\\s]+)', text)
-        customer_name = name_match.group(1).strip() if name_match else None
+        # Transaction ID (ixtiyoriy)
+        transaction_id = None
+        try:
+            trans_match = re.search(r'[a-f0-9]{24}', text, re.IGNORECASE)
+            if trans_match:
+                transaction_id = trans_match.group(0)
+        except:
+            pass
         
-        # 5. Transaction ID (agar bo'lsa)
-        trans_match = re.search(r'🆔\\s*([a-f0-9]+)', text, re.IGNORECASE)
-        transaction_id = trans_match.group(1) if trans_match else None
-        
-        # 6. Chek ID (agar bo'lsa)
-        receipt_match = re.search(r'🧾\\s*(\\d+)', text)
-        receipt_id = receipt_match.group(1) if receipt_match else None
-        
-        # 7. Karta maskasi (agar bo'lsa)
-        card_match = re.search(r'💳\\s*(\\d{6}[*\\s]+\\d{4})', text)
-        card_mask = card_match.group(1).replace(' ', '') if card_match else None
+        # Chek ID (ixtiyoriy)
+        receipt_id = None
+        try:
+            # 🧾 569 yoki shunga o'xshash
+            receipt_match = re.search(r'🧾\s*(\d+)', text)
+            if receipt_match:
+                receipt_id = receipt_match.group(1)
+        except:
+            pass
         
         result = {
-            'order_id': order_id,  # Asl case da saqlanadi
+            'order_id': order_id,
             'amount': amount,
-            'card_mask': card_mask,
+            'card_mask': None,  # Endi shart emas
             'receipt_id': receipt_id,
             'transaction_id': transaction_id,
-            'customer_name': customer_name,
-            'raw_text': text[:200]  # Log uchun qisqa matn
+            'customer_name': None,  # Endi shart emas
+            'raw_text': text[:100]  # Log uchun qisqa matn
         }
         
-        logger.info(f"✅ Chek parse qilindi: {order_id}")
         return result
         
     except Exception as e:
@@ -339,8 +326,67 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 # ==========================================
-# TO'LIQ PROCESS_PAYME_RECEIPT FUNKSiyasi
+# PAYME CHEK HANDLER - SODDALASHTIRILGAN
 # ==========================================
+
+async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Payme cheklar kelganda - faqat ORD_ qidiradi"""
+    try:
+        message = update.message
+        if not message or not message.text:
+            return
+        
+        chat_id = message.chat_id
+        text = message.text
+        
+        # Log
+        logger.info(f"📩 Xabar qabul qilindi: chat_id={chat_id}")
+        logger.info(f"📝 Xabar matni: {text[:200]}...")
+        
+        # Faqat belgilangan guruhda ishlaydi
+        if PAYME_GROUP_ID_INT and chat_id != PAYME_GROUP_ID_INT:
+            logger.debug(f"⏭️ Boshqa chat: {chat_id} != {PAYME_GROUP_ID_INT}")
+            return
+        
+        # Asosiy tekshirish: ORD_ bormi? (case insensitive)
+        if not re.search(r'ORD_', text, re.IGNORECASE):
+            logger.debug("⏭️ ORD_ pattern topilmadi")
+            return
+        
+        logger.info(f"✅ ORD_ pattern aniqlandi! Parse qilinmoqda...")
+        
+        # Parse qilish
+        receipt_data = parse_payme_receipt(text)
+        if not receipt_data:
+            logger.warning("❌ Chek parse qilinmadi")
+            return
+        
+        order_id = receipt_data.get('order_id')
+        if not order_id:
+            logger.error("❌ ORDER ID yo'q")
+            return
+        
+        logger.info(f"✅ ORDER ID: {order_id}")
+        
+        # Buyurtmani qayta ishlash
+        success = await process_payme_receipt(receipt_data, context.bot)
+        
+        if success:
+            try:
+                await message.reply_text(
+                    f"✅ Buyurtma #{order_id[-6:]} to'lovi qabul qilindi!",
+                    quote=True
+                )
+                logger.info(f"✅ Javob yuborildi")
+            except Exception as e:
+                logger.warning(f"⚠️ Javob yuborishda xato: {e}")
+        else:
+            logger.error(f"❌ Buyurtma qayta ishlanmadi: {order_id}")
+            
+    except Exception as e:
+        logger.error(f"❌ Handler xatosi: {e}")
+        import traceback
+        traceback.print_exc()
 
 async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
     """Payme chekni qayta ishlash - faqat ORDER ID tekshiradi"""
@@ -405,71 +451,7 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
         traceback.print_exc()
         return False
 
-async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Payme cheklar kelganda - FAQAT ORDER ID tekshiradi"""
-    try:
-        message = update.message
-        if not message or not message.text:
-            return
-        
-        chat_id = message.chat_id
-        text = message.text
-        
-        # Log
-        logger.info(f"📩 Xabar: chat_id={chat_id}, text={text[:100]}...")
-        
-        # Faqat belgilangan guruhda ishlaydi
-        if PAYME_GROUP_ID_INT and chat_id != PAYME_GROUP_ID_INT:
-            logger.debug(f"⏭️ Boshqa chat: {chat_id} != {PAYME_GROUP_ID_INT}")
-            return
-        
-        # Asosiy tekshirish: "Номер заказа" va ORD_ bormi?
-        text_lower = text.lower()
-        
-        # Tekshirish 1: "номер заказа" yoki "order" so'zlari bormi?
-        has_order_text = 'номер заказа' in text_lower or 'order id' in text_lower or 'order:' in text_lower
-        
-        # Tekshirish 2: ORD_ patterni bormi?
-        has_ord_pattern = 'ord_' in text_lower
-        
-        if not (has_order_text and has_ord_pattern):
-            logger.debug(f"⏭️ Chek emas: order_text={has_order_text}, ord_pattern={has_ord_pattern}")
-            return
-        
-        logger.info(f"✅ Payme chek aniqlandi! Parse qilinmoqda...")
-        
-        # Parse qilish
-        receipt_data = parse_payme_receipt(text)
-        if not receipt_data:
-            logger.warning("❌ Chek parse qilinmadi")
-            return
-        
-        order_id = receipt_data.get('order_id')
-        if not order_id:
-            logger.error("❌ ORDER ID yo'q")
-            return
-        
-        logger.info(f"✅ ORDER ID: {order_id}")
-        
-        # Buyurtmani qayta ishlash
-        success = await process_payme_receipt(receipt_data, context.bot)
-        
-        if success:
-            try:
-                await message.reply_text(
-                    f"✅ Buyurtma #{order_id[-6:]} to'lovi qabul qilindi!",
-                    quote=True
-                )
-                logger.info(f"✅ Javob yuborildi")
-            except Exception as e:
-                logger.warning(f"⚠️ Javob yuborishda xato: {e}")
-        else:
-            logger.error(f"❌ Buyurtma qayta ishlanmadi: {order_id}")
-            
-    except Exception as e:
-        logger.error(f"❌ Handler xatosi: {e}")
-        import traceback
-        traceback.print_exc()
+
 
 def save_user_profile(tg_id: int, name: str, phone: str, username: str = None) -> bool:
     """Foydalanuvchi profilini saqlash yoki yangilash"""
