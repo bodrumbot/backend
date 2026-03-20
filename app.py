@@ -439,7 +439,7 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
             conn.close()
 
 def create_order(data: Dict) -> Optional[Dict]:
-    """Yangi buyurtma yaratish va admin ga xabar yuborish"""
+    """Yangi buyurtma yaratish - faqat DB ga saqlash, adminga xabar YUBORMASLIK"""
     conn = None
     try:
         conn = get_db_connection()
@@ -488,8 +488,8 @@ def create_order(data: Dict) -> Optional[Dict]:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
             
-            # ⭐⭐⭐ YANGI: Admin ga xabar yuborish
-            asyncio.create_task(notify_admin_new_order(order_dict))
+            # ⭐ O'CHIRILDI: Adminga xabar faqat to'lov qilingach yuboriladi
+            # asyncio.create_task(notify_admin_new_order(order_dict))
             
             return order_dict
         return None
@@ -688,7 +688,7 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
 
 async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
     """
-    ⭐ PAYME CHEK KELGANDA: Avtomatik qabul qilmasdan, admin ga xabar yuborish
+    Payme chek kelganda: Buyurtma topilsa, to'lov statusini yangilash va adminga xabar
     """
     try:
         order_id = receipt_data.get('order_id')
@@ -700,6 +700,19 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
         order = get_order(order_id)
         if not order:
             logger.warning(f"⚠️ Buyurtma topilmadi: {order_id}")
+            # Agar buyurtma topilmasa, chekni ignor qilish (chunki oldindan yaratilmagan)
+            return False
+        
+        # ⭐ YANGI: Summani tekshirish (xavfsizlik uchun)
+        receipt_amount = receipt_data.get('amount', 0)
+        order_total = order.get('total', 0)
+        
+        if receipt_amount > 0 and receipt_amount != order_total:
+            logger.error(f"❌ Summa mos kelmadi! Chek: {receipt_amount}, Buyurtma: {order_total}")
+            await bot.send_message(
+                chat_id=ADMIN_CHAT_ID_INT,
+                text=f"⚠️ <b>Diqqat!</b>\n\nBuyurtma #{order_id[-6:]} summasi mos kelmadi!\nChek: {receipt_amount:,}\nBuyurtma: {order_total:,}"
+            )
             return False
         
         # Agar allaqachon qabul qilingan bo'lsa
@@ -707,10 +720,10 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
             logger.info(f"⚠️ Buyurtma allaqachon qabul qilingan: {order_id}")
             return True
         
-        # ⭐ FAQAT TO'LOV STATUSINI YANGILASH (avtomatik qabul qilmaydi!)
+        # To'lov statusini yangilash
         updated = update_order_status(
             order_id,
-            order.get('status', 'pending_payment'),  # ✅ Status o'zgarmaydi!
+            order.get('status', 'pending_payment'),
             payment_status='paid',
             transaction_id=receipt_data.get('transaction_id'),
             paid_at=datetime.utcnow().isoformat(),
@@ -722,9 +735,9 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
             logger.error(f"❌ Buyurtma yangilashda xatolik: {order_id}")
             return False
         
-        logger.info(f"✅ To'lov qabul qilindi (qo'lda tasdiqlash kutilmoqda): {order_id}")
-
-        # ⭐ ADMIN GA XABAR YUBORISH (qo'lda qabul qilish uchun)
+        logger.info(f"✅ To'lov qabul qilindi: {order_id}")
+        
+        # ⭐ ENDI admin ga xabar yuborish (to'lov qilingandan keyin)
         await notify_admin_payment_received(updated, bot)
         
         # Mijozga xabar
@@ -738,7 +751,7 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
                          f"💵 Summa: {format_price(updated.get('total', 0))} so'm\n"
                          f"💳 Karta: {receipt_data.get('card_mask', 'N/A')}\n\n"
                          f"⏳ Buyurtmangiz admin tasdig'ini kutyapti...\n"
-                         f"Tez orada qabul qililadi! 🚀",
+                         f"Tez orada qabul qilinadi! 🚀",
                     parse_mode='HTML'
                 )
             except Exception as e:
