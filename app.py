@@ -1,6 +1,6 @@
 # ==========================================
 # BODRUM BOT - PAYME CHEK PARSER + AUTO ACCEPT
-# To'g'rilangan versiya - Guruh handleri fix
+# To'g'rilangan versiya - Guruh handleri fixparse_payme_receipt
 # ==========================================
 
 import os
@@ -257,6 +257,10 @@ def send_telegram_location(chat_id: int, latitude: float, longitude: float) -> b
 # PAYME CHEK PARSER - TO'G'RILANGAN
 # ==========================================
 
+# ==========================================
+# PAYME CHEK PARSER - TO'G'RILANGAN
+# ==========================================
+
 def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
     """Payme chek parse - katta-kichik harflarni hisobga oladi"""
     try:
@@ -319,8 +323,121 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 # ==========================================
-# USER PROFILE FUNCTIONS
+# TO'LIQ PROCESS_PAYME_RECEIPT FUNKSiyasi
 # ==========================================
+
+async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
+    """Payme chekni qayta ishlash - TO'LIQ VERSION"""
+    try:
+        order_id = receipt_data.get('order_id')
+        if not order_id:
+            logger.error("❌ Buyurtma ID yo'q")
+            return False
+        
+        logger.info(f"🔄 Buyurtma qidirilmoqda: {order_id}")
+        
+        order = get_order(order_id)
+        if not order:
+            logger.warning(f"⚠️ Buyurtma topilmadi: {order_id}")
+            return False
+        
+        logger.info(f"✅ Buyurtma topildi: {order_id}, status={order.get('status')}")
+        
+        # Buyurtma ma'lumotlarini yangilash
+        updated_order = update_order_status(
+            order_id,
+            'pending_payment',  # Status: to'lov qilingan, tasdiqlash kutilmoqda
+            payment_status='paid',
+            paid_at=datetime.utcnow().isoformat(),
+            transaction_id=receipt_data.get('transaction_id'),
+            payme_receipt_id=receipt_data.get('receipt_id'),
+            payme_card_mask=receipt_data.get('card_mask'),
+            notified=False  # Admin hali xabar olmagan
+        )
+        
+        if not updated_order:
+            logger.error("❌ Buyurtma yangilash xatosi")
+            return False
+        
+        logger.info(f"✅ Buyurtma yangilandi: {order_id}")
+        
+        # ⭐ MUHIM: Admin ga xabar yuborish
+        await notify_admin_payment_received(updated_order, bot)
+        
+        # Mijozga ham xabar yuborish
+        tg_id = order.get('tg_id')
+        if tg_id and bot:
+            try:
+                await bot.send_message(
+                    chat_id=tg_id,
+                    text=f"✅ To'lovingiz qabul qilindi!\n\n"
+                         f"🆔 Buyurtma: #{order_id[-6:]}\n"
+                         f"💵 Summa: {receipt_data.get('amount', 0):,} so'm\n\n"
+                         f"Buyurtmangiz tez orada qabul qilinadi."
+                )
+                logger.info(f"✅ Mijozga xabar yuborildi: {tg_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ Mijozga xabar yuborishda xato: {e}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Process receipt xatosi: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# ==========================================
+# GURUH HANDLER - TO'LIQ TO'G'RILANGAN
+# ==========================================
+
+async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Payme cheklar kelganda - TO'G'RILANGAN"""
+    message = update.message
+    if not message or not message.text:
+        return
+    
+    chat_id = message.chat_id
+    text = message.text
+    
+    # Log har bir xabar uchun
+    logger.info(f"📩 Guruh xabari: chat_id={chat_id}, text_preview={text[:50]}...")
+    
+    # Faqat belgilangan guruhda ishlaydi (agar sozlangan bo'lsa)
+    if PAYME_GROUP_ID_INT and chat_id != PAYME_GROUP_ID_INT:
+        logger.debug(f"⏭️ Boshqa chat: {chat_id} != {PAYME_GROUP_ID_INT}")
+        return
+    
+    # Payme chek ekanligini tekshirish (katta-kichik harf farqi yo'q)
+    text_lower = text.lower()
+    has_bodrum = 'bodrum' in text_lower
+    has_order = 'номер заказа' in text_lower or 'ord_' in text_lower
+    
+    if not (has_bodrum and has_order):
+        logger.debug(f"⏭️ Payme chek emas: bodrum={has_bodrum}, order={has_order}")
+        return
+    
+    logger.info(f"✅ Payme chek aniqlandi! Parse qilinmoqda...")
+    
+    # Chekni parse qilish
+    receipt_data = parse_payme_receipt(text)
+    if not receipt_data:
+        logger.warning("❌ Chek parse qilinmadi")
+        return
+    
+    logger.info(f"✅ Chek parsed: {receipt_data['order_id']}")
+    
+    # Avtomatik qabul qilish
+    success = await process_payme_receipt(receipt_data, context.bot)
+    
+    if success:
+        try:
+            await message.reply_text(
+                f"✅ Buyurtma #{receipt_data['order_id'][-6:]} to'lovi qabul qilindi!",
+                quote=True
+            )
+        except Exception as e:
+            logger.warning(f"Guruhga javob yuborishda xato: {e}")
 
 def save_user_profile(tg_id: int, name: str, phone: str, username: str = None) -> bool:
     """Foydalanuvchi profilini saqlash yoki yangilash"""
@@ -587,30 +704,7 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         if conn:
             conn.close()
 
-async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
-    """Payme chekni qayta ishlash - LOG bilan"""
-    try:
-        order_id = receipt_data.get('order_id')
-        if not order_id:
-            logger.error("❌ Buyurtma ID yo'q")
-            return False
-        
-        logger.info(f"🔄 Buyurtma qidirilmoqda: {order_id}")
-        
-        order = get_order(order_id)
-        if not order:
-            logger.warning(f"⚠️ Buyurtma topilmadi: {order_id}")
-            return False
-        
-        logger.info(f"✅ Buyurtma topildi: {order_id}, status={order.get('status')}")
-        
-        # ... qolgan qismi o'zgarmaydi ...
-        
-    except Exception as e:
-        logger.error(f"❌ Process receipt xatosi: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+
 
 async def notify_admin_payment_received(order: Dict, bot=None):
     """
@@ -967,56 +1061,6 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         f"⏳ Ularni qabul qilish yoki bekor qilish mumkin.",
         parse_mode='HTML'
     )
-
-
-async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Payme cheklar kelganda - TO'G'RILANGAN"""
-    message = update.message
-    if not message or not message.text:
-        return
-    
-    chat_id = message.chat_id
-    text = message.text
-    
-    # Log har bir xabar uchun
-    logger.info(f"📩 Guruh xabari: chat_id={chat_id}, text_preview={text[:50]}...")
-    
-    # Faqat belgilangan guruhda ishlaydi (agar sozlangan bo'lsa)
-    if PAYME_GROUP_ID_INT and chat_id != PAYME_GROUP_ID_INT:
-        logger.debug(f"⏭️ Boshqa chat: {chat_id} != {PAYME_GROUP_ID_INT}")
-        return
-    
-    # Payme chek ekanligini tekshirish (katta-kichik harf farqi yo'q)
-    text_lower = text.lower()
-    has_bodrum = 'bodrum' in text_lower
-    has_order = 'номер заказа' in text_lower or 'ord_' in text_lower
-    
-    if not (has_bodrum and has_order):
-        logger.debug(f"⏭️ Payme chek emas: bodrum={has_bodrum}, order={has_order}")
-        return
-    
-    logger.info(f"✅ Payme chek aniqlandi! Parse qilinmoqda...")
-    
-    # Chekni parse qilish
-    receipt_data = parse_payme_receipt(text)
-    if not receipt_data:
-        logger.warning("❌ Chek parse qilinmadi")
-        return
-    
-    logger.info(f"✅ Chek parsed: {receipt_data['order_id']}")
-    
-    # Avtomatik qabul qilish
-    success = await process_payme_receipt(receipt_data, context.bot)
-    
-    if success:
-        try:
-            await message.reply_text(
-                f"✅ Buyurtma #{receipt_data['order_id'][-6:]} to'lovi qabul qilindi!",
-                quote=True
-            )
-        except Exception as e:
-            logger.warning(f"Guruhga javob yuborishda xato: {e}")
-
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback query handler"""
