@@ -261,28 +261,42 @@ def send_telegram_location(chat_id: int, latitude: float, longitude: float) -> b
 # PAYME CHEK PARSER - TO'G'RILANGAN
 # ==========================================
 
+# ==========================================
+# PAYME CHEK PARSER - FAQAT ORDER ID TEKSHIRISH
+# ==========================================
+
 def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
-    """Payme chek parse - katta-kichik harflarni hisobga oladi"""
+    """Payme chek parse - faqat ORDER ID ni tekshiradi"""
     try:
         if not text:
             return None
         
+        # 1. "Номер заказа:" yoki "Order ID:" qidirish
         # Katta-kichik harf farqi yo'q
         text_lower = text.lower()
         
-        if 'bodrum' not in text_lower and 'номер заказа' not in text_lower:
+        # Tekshirish: "номер заказа" yoki "order" so'zlari bormi
+        has_order_marker = 'номер заказа' in text_lower or 'order' in text_lower
+        
+        if not has_order_marker:
+            logger.debug(f"⏭️ 'Номер заказа' yoki 'order' topilmadi")
             return None
         
-        # Buyurtma ID - re.IGNORECASE bilan
-        order_match = re.search(r'ORD_[A-Za-z0-9_]+', text, re.IGNORECASE)
+        # 2. Faqat ORDER ID ni olish - eng muhim qism
+        # Format: ORD_1234567890_abcdefgh
+        order_match = re.search(r'ORD_[A-Za-z0-9_]+', text)
         if not order_match:
+            logger.warning("❌ ORDER ID pattern topilmadi")
             return None
         
         order_id = order_match.group(0).upper()  # Katta harfga o'tkazish
         
-        # Summa
-        amount_match = re.search(r'🇺🇿\s*([\d\s,]+)\s*сум', text, re.IGNORECASE)
+        logger.info(f"✅ ORDER ID topildi: {order_id}")
+        
+        # 3. Summa (agar bo'lsa)
         amount = 0
+        # Format: 🇺🇿 1 000,00 сум
+        amount_match = re.search(r'🇺🇿\s*([\d\s,]+)\s*сум', text, re.IGNORECASE)
         if amount_match:
             amount_str = amount_match.group(1).replace(' ', '').replace(',', '.')
             try:
@@ -290,33 +304,34 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
             except:
                 pass
         
-        # Karta maskasi (bo'sh joylarni hisobga olgan holda)
-        card_match = re.search(r'💳\s*(\d{6}[*\s]+\d{4})', text)
-        card_mask = None
-        if card_match:
-            card_mask = card_match.group(1).replace(' ', '').replace('****', '******')
-        
-        # Payme chek ID
-        receipt_match = re.search(r'🧾\s*(\d+)', text)
-        receipt_id = receipt_match.group(1) if receipt_match else None
-        
-        # Transaction ID
-        trans_match = re.search(r'🆔\s*([a-f0-9]+)', text, re.IGNORECASE)
-        transaction_id = trans_match.group(1) if trans_match else None
-        
-        # Mijoz ismi (kirill va lotin)
+        # 4. Mijoz ismi (agar bo'lsa)
         name_match = re.search(r'👤\s*([А-Яа-яЁёA-Za-z\s]+)', text)
         customer_name = name_match.group(1).strip() if name_match else None
         
-        return {
+        # 5. Transaction ID (agar bo'lsa)
+        trans_match = re.search(r'🆔\s*([a-f0-9]+)', text, re.IGNORECASE)
+        transaction_id = trans_match.group(1) if trans_match else None
+        
+        # 6. Chek ID (agar bo'lsa)
+        receipt_match = re.search(r'🧾\s*(\d+)', text)
+        receipt_id = receipt_match.group(1) if receipt_match else None
+        
+        # 7. Karta maskasi (agar bo'lsa)
+        card_match = re.search(r'💳\s*(\d{6}[*\s]+\d{4})', text)
+        card_mask = card_match.group(1).replace(' ', '') if card_match else None
+        
+        result = {
             'order_id': order_id,
             'amount': amount,
             'card_mask': card_mask,
             'receipt_id': receipt_id,
             'transaction_id': transaction_id,
             'customer_name': customer_name,
-            'raw_text': text
+            'raw_text': text[:200]  # Log uchun qisqa matn
         }
+        
+        logger.info(f"✅ Chek parse qilindi: {order_id}")
+        return result
         
     except Exception as e:
         logger.error(f"❌ Chek parse xatosi: {e}")
@@ -327,32 +342,33 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
 # ==========================================
 
 async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
-    """Payme chekni qayta ishlash - TO'LIQ VERSION"""
+    """Payme chekni qayta ishlash - faqat ORDER ID tekshiradi"""
     try:
         order_id = receipt_data.get('order_id')
         if not order_id:
-            logger.error("❌ Buyurtma ID yo'q")
+            logger.error("❌ ORDER ID yo'q")
             return False
         
         logger.info(f"🔄 Buyurtma qidirilmoqda: {order_id}")
         
+        # Buyurtmani topish
         order = get_order(order_id)
         if not order:
             logger.warning(f"⚠️ Buyurtma topilmadi: {order_id}")
             return False
         
-        logger.info(f"✅ Buyurtma topildi: {order_id}, status={order.get('status')}")
+        logger.info(f"✅ Buyurtma topildi: {order_id}")
         
         # Buyurtma ma'lumotlarini yangilash
         updated_order = update_order_status(
             order_id,
-            'pending_payment',  # Status: to'lov qilingan, tasdiqlash kutilmoqda
+            'pending_payment',  # To'lov qilingan, tasdiqlash kutilmoqda
             payment_status='paid',
             paid_at=datetime.utcnow().isoformat(),
             transaction_id=receipt_data.get('transaction_id'),
             payme_receipt_id=receipt_data.get('receipt_id'),
             payme_card_mask=receipt_data.get('card_mask'),
-            notified=False  # Admin hali xabar olmagan
+            notified=False
         )
         
         if not updated_order:
@@ -361,10 +377,10 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
         
         logger.info(f"✅ Buyurtma yangilandi: {order_id}")
         
-        # ⭐ MUHIM: Admin ga xabar yuborish
+        # Admin ga xabar yuborish
         await notify_admin_payment_received(updated_order, bot)
         
-        # Mijozga ham xabar yuborish
+        # Mijozga xabar yuborish
         tg_id = order.get('tg_id')
         if tg_id and bot:
             try:
@@ -391,53 +407,75 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
 # GURUH HANDLER - TO'LIQ TO'G'RILANGAN
 # ==========================================
 
+# ==========================================
+# GURUH HANDLER - FAQAT ORDER ID TEKSHIRISH
+# ==========================================
+
 async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Payme cheklar kelganda - TO'G'RILANGAN"""
-    message = update.message
-    if not message or not message.text:
-        return
-    
-    chat_id = message.chat_id
-    text = message.text
-    
-    # Log har bir xabar uchun
-    logger.info(f"📩 Guruh xabari: chat_id={chat_id}, text_preview={text[:50]}...")
-    
-    # Faqat belgilangan guruhda ishlaydi (agar sozlangan bo'lsa)
-    if PAYME_GROUP_ID_INT and chat_id != PAYME_GROUP_ID_INT:
-        logger.debug(f"⏭️ Boshqa chat: {chat_id} != {PAYME_GROUP_ID_INT}")
-        return
-    
-    # Payme chek ekanligini tekshirish (katta-kichik harf farqi yo'q)
-    text_lower = text.lower()
-    has_bodrum = 'bodrum' in text_lower
-    has_order = 'номер заказа' in text_lower or 'ord_' in text_lower
-    
-    if not (has_bodrum and has_order):
-        logger.debug(f"⏭️ Payme chek emas: bodrum={has_bodrum}, order={has_order}")
-        return
-    
-    logger.info(f"✅ Payme chek aniqlandi! Parse qilinmoqda...")
-    
-    # Chekni parse qilish
-    receipt_data = parse_payme_receipt(text)
-    if not receipt_data:
-        logger.warning("❌ Chek parse qilinmadi")
-        return
-    
-    logger.info(f"✅ Chek parsed: {receipt_data['order_id']}")
-    
-    # Avtomatik qabul qilish
-    success = await process_payme_receipt(receipt_data, context.bot)
-    
-    if success:
-        try:
-            await message.reply_text(
-                f"✅ Buyurtma #{receipt_data['order_id'][-6:]} to'lovi qabul qilindi!",
-                quote=True
-            )
-        except Exception as e:
-            logger.warning(f"Guruhga javob yuborishda xato: {e}")
+    """Payme cheklar kelganda - FAQAT ORDER ID tekshiradi"""
+    try:
+        message = update.message
+        if not message or not message.text:
+            return
+        
+        chat_id = message.chat_id
+        text = message.text
+        
+        # Log
+        logger.info(f"📩 Xabar: chat_id={chat_id}, text={text[:100]}...")
+        
+        # Faqat belgilangan guruhda ishlaydi
+        if PAYME_GROUP_ID_INT and chat_id != PAYME_GROUP_ID_INT:
+            logger.debug(f"⏭️ Boshqa chat: {chat_id} != {PAYME_GROUP_ID_INT}")
+            return
+        
+        # Asosiy tekshirish: "Номер заказа" va ORD_ bormi?
+        text_lower = text.lower()
+        
+        # Tekshirish 1: "номер заказа" yoki "order" so'zlari bormi?
+        has_order_text = 'номер заказа' in text_lower or 'order id' in text_lower or 'order:' in text_lower
+        
+        # Tekshirish 2: ORD_ patterni bormi?
+        has_ord_pattern = 'ord_' in text_lower
+        
+        if not (has_order_text and has_ord_pattern):
+            logger.debug(f"⏭️ Chek emas: order_text={has_order_text}, ord_pattern={has_ord_pattern}")
+            return
+        
+        logger.info(f"✅ Payme chek aniqlandi! Parse qilinmoqda...")
+        
+        # Parse qilish
+        receipt_data = parse_payme_receipt(text)
+        if not receipt_data:
+            logger.warning("❌ Chek parse qilinmadi")
+            return
+        
+        order_id = receipt_data.get('order_id')
+        if not order_id:
+            logger.error("❌ ORDER ID yo'q")
+            return
+        
+        logger.info(f"✅ ORDER ID: {order_id}")
+        
+        # Buyurtmani qayta ishlash
+        success = await process_payme_receipt(receipt_data, context.bot)
+        
+        if success:
+            try:
+                await message.reply_text(
+                    f"✅ Buyurtma #{order_id[-6:]} to'lovi qabul qilindi!",
+                    quote=True
+                )
+                logger.info(f"✅ Javob yuborildi")
+            except Exception as e:
+                logger.warning(f"⚠️ Javob yuborishda xato: {e}")
+        else:
+            logger.error(f"❌ Buyurtma qayta ishlanmadi: {order_id}")
+            
+    except Exception as e:
+        logger.error(f"❌ Handler xatosi: {e}")
+        import traceback
+        traceback.print_exc()
 
 def save_user_profile(tg_id: int, name: str, phone: str, username: str = None) -> bool:
     """Foydalanuvchi profilini saqlash yoki yangilash"""
@@ -1573,28 +1611,27 @@ async def init_webhook(app):
     application = Application.builder().token(TOKEN).build()
     
     # ========== HANDLERS ==========
+    # Tartibi MUHIM: Guruh handlerlari birinchi, shaxsiy chatlar keyin
     
-    # 1. Command handlers
+    # 1. ⭐⭐⭐ PAYME CHEK HANDLER - Eng yuqori priority (group=0)
+    # Guruh va supergrouplar uchun
+    application.add_handler(MessageHandler(
+        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP),
+        payme_receipt_handler
+    ), group=0)  # group=0 - eng yuqori priority
+    
+    # 2. Command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("myorders", myorders_command))
     
-    # 2. ⭐⭐⭐ TO'G'RILANGAN: Payme chek handler
-    # AVVAL: filters.ChatType.GROUPS - bu faqat supergroups uchun
-    # ENDI: filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP - ikkisi uchun ham
-    
-    application.add_handler(MessageHandler(
-        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP),
-        payme_receipt_handler
-    ), group=1)
-    
-    # Shaxsiy chatlar uchun contact
+    # 3. Shaxsiy chatlar uchun contact
     application.add_handler(MessageHandler(
         filters.CONTACT & filters.ChatType.PRIVATE,
         contact_handler
     ))
     
-    # Callback queries
+    # 4. Callback queries
     application.add_handler(CallbackQueryHandler(callback_handler))
     
     await application.initialize()
