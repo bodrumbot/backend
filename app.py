@@ -1,6 +1,6 @@
 # ==========================================
 # BODRUM BOT - PAYME CHEK PARSER + AUTO ACCEPT
-# Guruhda Payme chekidan buyurtma ID ni o'qib, avtomatik qabul qilish
+# To'g'rilangan versiya - Guruh handleri fix
 # ==========================================
 
 import os
@@ -52,14 +52,34 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 
 # ⭐ MUHIM: Payme cheklar keladigan guruh ID si
-# Guruh ID si odatda -100 bilan boshlanadi, masalan: -1001234567890
 PAYME_RECEIPTS_GROUP_ID = os.getenv("PAYME_RECEIPTS_GROUP_ID", "")
+
+# ⭐ YANGI: Guruh ID sini to'g'ri parse qilish
+def parse_chat_id(chat_id_str):
+    """Guruh ID sini to'g'ri formatga o'tkazish"""
+    if not chat_id_str:
+        return 0
+    try:
+        # -1001234567890 formatida bo'lishi kerak
+        chat_id = str(chat_id_str).strip()
+        # Agar -100 bilan boshlanmasa, qo'shish
+        if chat_id.startswith('-100'):
+            return int(chat_id)
+        elif chat_id.startswith('-'):
+            # -1234567890 -> -1001234567890
+            return int(f"-100{chat_id[1:]}")
+        else:
+            # 1234567890 -> -1001234567890
+            return int(f"-100{chat_id}")
+    except Exception as e:
+        logger.error(f"❌ Chat ID parse xatosi: {e}, value: {chat_id_str}")
+        return 0
 
 try:
     ADMIN_CHAT_ID_INT = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else 0
-    PAYME_GROUP_ID_INT = int(PAYME_RECEIPTS_GROUP_ID) if PAYME_RECEIPTS_GROUP_ID else 0
-except ValueError:
-    logger.error(f"❌ ADMIN_CHAT_ID yoki PAYME_RECEIPTS_GROUP_ID noto'g'ri formatda")
+    PAYME_GROUP_ID_INT = parse_chat_id(PAYME_RECEIPTS_GROUP_ID)
+except ValueError as e:
+    logger.error(f"❌ Chat ID parse xatosi: {e}")
     ADMIN_CHAT_ID_INT = 0
     PAYME_GROUP_ID_INT = 0
 
@@ -120,8 +140,8 @@ def init_database():
             ('confirmed_at', 'TIMESTAMP'),
             ('accepted_at', 'TIMESTAMP'),
             ('rejected_at', 'TIMESTAMP'),
-            ('payme_receipt_id', 'VARCHAR(100)'),  # ⭐ Payme chek ID si
-            ('payme_card_mask', 'VARCHAR(50)')     # ⭐ Karta maskasi
+            ('payme_receipt_id', 'VARCHAR(100)'),
+            ('payme_card_mask', 'VARCHAR(50)')
         ]
         
         for col_name, col_type in columns_to_check:
@@ -234,38 +254,42 @@ def send_telegram_location(chat_id: int, latitude: float, longitude: float) -> b
         return False
 
 # ==========================================
-# PAYME CHEK PARSER
+# PAYME CHEK PARSER - TO'G'RILANGAN
 # ==========================================
 
 def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
     """
     Payme chek matnidan buyurtma ID va boshqa ma'lumotlarni ajratib olish
-    
-    Namuna:
-    📍 bodrum bot
-    🧾 552
-    👤 OMONOVA NILUFAR
-    💳 561468******0845
-    🇺🇿 1 000,00 сум
-    🔸 Номер заказа: ORD_1773916798067_tvzseftxq
-    🕓 15:40:19 19.03.2026
-    🆔 69bbd27b62b6af0150f6a053
-    ✅ Успешно оплачен
+    Katta-kichik harflarni hisobga oladi!
     """
     try:
-        if not text or 'bodrum bot' not in text.lower():
+        if not text:
             return None
         
+        text_lower = text.lower()
+        
+        # "bodrum bot" yoki "номер заказа" yoki "ord_" ni tekshirish
+        has_bodrum = 'bodrum' in text_lower or 'bot' in text_lower
+        has_order = 'номер заказа' in text_lower or 'ord_' in text_lower
+        has_success = 'успешно' in text_lower or 'оплачен' in text_lower or '✅' in text
+        
+        if not (has_bodrum or has_order):
+            logger.debug(f"⏭️ Payme chek emas: {text[:50]}...")
+            return None
+        
+        logger.info(f"🔍 Chek parse qilinmoqda: {text[:100]}...")
+        
         # Buyurtma ID ni topish - ORD_ bilan boshlanadi
-        order_match = re.search(r'ORD_[A-Za-z0-9_]+', text)
+        # Katta-kichik harflarni hisobga olmaydi (re.IGNORECASE)
+        order_match = re.search(r'ORD_[A-Za-z0-9_]+', text, re.IGNORECASE)
         if not order_match:
             logger.warning("❌ Buyurtma ID topilmadi chekda")
             return None
         
-        order_id = order_match.group(0)
+        order_id = order_match.group(0).upper()  # Katta harfga o'tkazish
         
         # Summa ni topish
-        amount_match = re.search(r'🇺🇿\s*([\d\s,]+)\s*сум', text)
+        amount_match = re.search(r'🇺🇿\s*([\d\s,]+)\s*сум', text, re.IGNORECASE)
         amount = 0
         if amount_match:
             amount_str = amount_match.group(1).replace(' ', '').replace(',', '.')
@@ -275,20 +299,24 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
                 pass
         
         # Karta maskasi
-        card_match = re.search(r'💳\s*(\d{6}\*+\d{4})', text)
-        card_mask = card_match.group(1) if card_match else None
+        card_match = re.search(r'💳\s*(\d{6}[*\s]+\d{4})', text)
+        card_mask = None
+        if card_match:
+            card_mask = card_match.group(1).replace(' ', '').replace('****', '******')
         
         # Payme chek ID si
         receipt_match = re.search(r'🧾\s*(\d+)', text)
         receipt_id = receipt_match.group(1) if receipt_match else None
         
         # Payme transaction ID
-        trans_match = re.search(r'🆔\s*([a-f0-9]+)', text)
+        trans_match = re.search(r'🆔\s*([a-f0-9]+)', text, re.IGNORECASE)
         transaction_id = trans_match.group(1) if trans_match else None
         
         # Mijoz ismi
-        name_match = re.search(r'👤\s*([A-Z\s]+)', text)
-        customer_name = name_match.group(1).strip() if name_match else None
+        name_match = re.search(r'👤\s*([А-Яа-яЁёA-Za-z\s]+)', text)
+        customer_name = None
+        if name_match:
+            customer_name = name_match.group(1).strip()
         
         logger.info(f"✅ Chek parsed: order_id={order_id}, amount={amount}, card={card_mask}")
         
@@ -304,6 +332,8 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
         
     except Exception as e:
         logger.error(f"❌ Chek parse xatosi: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 # ==========================================
@@ -439,7 +469,7 @@ def get_order(order_id: str) -> Optional[Dict[str, Any]]:
             conn.close()
 
 def create_order(data: Dict) -> Optional[Dict]:
-    """Yangi buyurtma yaratish - faqat DB ga saqlash, adminga xabar YUBORMASLIK"""
+    """Yangi buyurtma yaratish"""
     conn = None
     try:
         conn = get_db_connection()
@@ -487,10 +517,6 @@ def create_order(data: Dict) -> Optional[Dict]:
             for key in ['created_at', 'accepted_at', 'rejected_at', 'paid_at', 'confirmed_at']:
                 if order_dict.get(key) and hasattr(order_dict[key], 'isoformat'):
                     order_dict[key] = order_dict[key].isoformat()
-            
-            # ⭐ O'CHIRILDI: Adminga xabar faqat to'lov qilingach yuboriladi
-            # asyncio.create_task(notify_admin_new_order(order_dict))
-            
             return order_dict
         return None
         
@@ -504,113 +530,6 @@ def create_order(data: Dict) -> Optional[Dict]:
     finally:
         if conn:
             conn.close()
-
-
-async def notify_admin_new_order(order: Dict):
-    """
-    ⭐ YANGI BUYURTMANI ADMIN GA XABAR QILISH
-    """
-    try:
-        logger.info(f"🔔 Yangi buyurtma admin ga xabar: {order.get('order_id')}")
-        
-        if not ADMIN_CHAT_ID_INT:
-            logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
-            return False
-        
-        global application
-        bot = None
-        if application and application.bot:
-            bot = application.bot
-        else:
-            logger.error("❌ Bot mavjud emas!")
-            return False
-        
-        items = order.get('items', [])
-        if isinstance(items, str):
-            items = json.loads(items)
-        
-        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-        
-        raw_phone = order.get('phone', '')
-        phone_display = format_phone_display(raw_phone)
-        
-        customer_name = order.get('name', 'Mijoz')
-        if not customer_name or customer_name == 'null':
-            customer_name = 'Mijoz'
-        
-        location = order.get('location')
-        location_text = ""
-        location_coords = None
-        
-        if location and ',' in str(location):
-            try:
-                lat, lng = str(location).split(',')
-                lat = float(lat.strip())
-                lng = float(lng.strip())
-                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
-                location_coords = (lat, lng)
-            except Exception as e:
-                logger.warning(f"Joylashuv parse xatosi: {e}")
-                location_text = f"\n📍 <b>Manzil:</b> {location}"
-        elif location:
-            location_text = f"\n📍 <b>Manzil:</b> {location}"
-        
-        source = order.get('source', 'website')
-        source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
-        
-        admin_message = f"""🆕 <b>YANGI BUYURTMA!</b>
-
-🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
-👤 Mijoz: {customer_name}
-📞 Telefon: {phone_display}
-💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: {order.get('payment_method', 'payme').upper()} (kutilmoqda)
-📱 Manba: {source_icon}{location_text}
-
-🍽 Mahsulotlar:
-{items_text}
-
-⏰ {datetime.now().strftime('%H:%M:%S')}
-
-<i>💳 Mijoz to'lov qilganda avtomatik qabul qilinadi</i>"""
-
-        # Tugmalar
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
-                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
-            ]
-        ]
-        
-        sent_message = await bot.send_message(
-            chat_id=ADMIN_CHAT_ID_INT,
-            text=admin_message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-        
-        # Joylashuvni alohida yuborish
-        if location_coords:
-            try:
-                await bot.send_location(
-                    chat_id=ADMIN_CHAT_ID_INT,
-                    latitude=location_coords[0],
-                    longitude=location_coords[1]
-                )
-            except Exception as e:
-                logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
-        
-        # notified=True qilish
-        update_order_status(order.get('order_id'), order.get('status'), notified=True)
-        
-        logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ notify_admin_new_order xatosi: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
 
 def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[str, Any]]:
     conn = None
@@ -647,7 +566,7 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
             if cur.fetchone():
                 update_data['paid_at'] = kwargs.get('paid_at')
         
-        # ⭐ notified parametri
+        # notified parametri
         if 'notified' in kwargs:
             update_data['notified'] = kwargs['notified']
         
@@ -696,14 +615,17 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
             logger.error("❌ Buyurtma ID yo'q")
             return False
         
+        logger.info(f"🔄 Buyurtma qidirilmoqda: {order_id}")
+        
         # Buyurtmani topish
         order = get_order(order_id)
         if not order:
             logger.warning(f"⚠️ Buyurtma topilmadi: {order_id}")
-            # Agar buyurtma topilmasa, chekni ignor qilish (chunki oldindan yaratilmagan)
             return False
         
-        # ⭐ YANGI: Summani tekshirish (xavfsizlik uchun)
+        logger.info(f"✅ Buyurtma topildi: {order_id}, status: {order.get('status')}")
+        
+        # Summani tekshirish
         receipt_amount = receipt_data.get('amount', 0)
         order_total = order.get('total', 0)
         
@@ -716,14 +638,14 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
             return False
         
         # Agar allaqachon qabul qilingan bo'lsa
-        if order.get('status') == 'accepted':
-            logger.info(f"⚠️ Buyurtma allaqachon qabul qilingan: {order_id}")
+        if order.get('status') == 'accepted' and order.get('payment_status') == 'paid':
+            logger.info(f"⚠️ Buyurtma allaqachon to'langan va qabul qilingan: {order_id}")
             return True
         
         # To'lov statusini yangilash
         updated = update_order_status(
             order_id,
-            order.get('status', 'pending_payment'),
+            'pending_payment',  # Status o'zgarmaydi, faqat payment_status
             payment_status='paid',
             transaction_id=receipt_data.get('transaction_id'),
             paid_at=datetime.utcnow().isoformat(),
@@ -737,7 +659,7 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
         
         logger.info(f"✅ To'lov qabul qilindi: {order_id}")
         
-        # ⭐ ENDI admin ga xabar yuborish (to'lov qilingandan keyin)
+        # Admin ga xabar
         await notify_admin_payment_received(updated, bot)
         
         # Mijozga xabar
@@ -767,7 +689,7 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
 
 async def notify_admin_payment_received(order: Dict, bot=None):
     """
-    ⭐ ADMIN GA TO'LOV QILINGANLIGI HAQIDA XABAR (qo'lda qabul qilish uchun)
+    Admin ga to'lov qilinganligi haqida xabar
     """
     try:
         logger.info(f"🔔 notify_admin_payment_received: {order.get('order_id')}")
@@ -820,7 +742,6 @@ async def notify_admin_payment_received(order: Dict, bot=None):
         source = order.get('source', 'website')
         source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
         
-        # ⭐ MUHIM: Endi "AVTOMATIK" emas, "QABUL QILISH KERAK"
         status_text = "💳 <b>TO'LOV QILINDI - QABUL QILISH KERAK!</b>"
         
         admin_message = f"""{status_text}
@@ -840,7 +761,6 @@ async def notify_admin_payment_received(order: Dict, bot=None):
 
 <i>⚡ To'lov muvaffaqiyatli! Buyurtmani qabul qiling yoki bekor qiling</i>"""
 
-        # ⭐ TUGMALAR - Admin qo'lda bosishi uchun
         keyboard = [
             [
                 InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
@@ -1206,27 +1126,54 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Message edit error: {e}")
                 await context.bot.send_message(chat_id=user.id, text="❌ Xatolik yuz berdi!")
 
-# ⭐⭐⭐ YANGI: PAYME CHEK HANDLER
+# ⭐⭐⭐ TO'G'RILANGAN: PAYME CHEK HANDLER
 async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    ⭐ Payme cheklar keladigan guruhda xabarlarni ushlash
+    Payme cheklar kelganda: Guruh va shaxsiy chatlarni qo'llab-quvvatlash
     """
     message = update.message
     if not message or not message.text:
         return
     
-    # Faqat belgilangan guruhda ishlaydi
     chat_id = message.chat_id
-    if PAYME_GROUP_ID_INT and chat_id != PAYME_GROUP_ID_INT:
-        logger.debug(f"⏭️ Boshqa guruh: {chat_id}, kerakli: {PAYME_GROUP_ID_INT}")
-        return
-    
     text = message.text
-    logger.info(f"📩 Guruh xabari: {text[:100]}...")
+    
+    logger.info(f"📩 Xabar keldi: chat_id={chat_id}, text={text[:100]}...")
     
     # Payme chek ekanligini tekshirish
-    if 'bodrum bot' not in text.lower() and 'номер заказа' not in text.lower():
+    text_lower = text.lower()
+    has_bodrum = 'bodrum' in text_lower or 'bot' in text_lower
+    has_order_marker = 'номер заказа' in text_lower or 'ord_' in text_lower
+    has_payment = 'успешно' in text_lower or 'оплачен' in text_lower or 'сум' in text_lower
+    
+    # Faqat kerakli guruhda ishlaydi (agar sozlangan bo'lsa)
+    if PAYME_GROUP_ID_INT:
+        # Guruh ID si formatini tekshirish (ikkalasi ham -100 bilan boshlanishi kerak)
+        expected_chat_id = PAYME_GROUP_ID_INT
+        if chat_id != expected_chat_id:
+            # Agar -100123 va -1001234567890 kabi farq bo'lsa
+            str_chat_id = str(chat_id)
+            str_expected = str(expected_chat_id)
+            
+            # Ikki xil formatni tekshirish
+            match = False
+            if str_chat_id == str_expected:
+                match = True
+            elif str_chat_id.endswith(str_expected.replace('-100', '')):
+                match = True
+            elif str_expected.endswith(str_chat_id.replace('-100', '')):
+                match = True
+            
+            if not match:
+                logger.info(f"⏭️ Boshqa chat: {chat_id} != {expected_chat_id}")
+                return
+    
+    # Chek ekanligini tekshirish
+    if not (has_bodrum and has_order_marker and has_payment):
+        logger.debug(f"⏭️ Payme chek emas: bodrum={has_bodrum}, order={has_order_marker}, payment={has_payment}")
         return
+    
+    logger.info(f"✅ Payme chek aniqlandi! Parse qilinmoqda...")
     
     # Chekni parse qilish
     receipt_data = parse_payme_receipt(text)
@@ -1240,10 +1187,10 @@ async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TY
     success = await process_payme_receipt(receipt_data, context.bot)
     
     if success:
-        # Guruhga tasdiq xabari (ixtiyoriy)
+        # Guruhga tasdiq xabari
         try:
             await message.reply_text(
-                f"✅ Buyurtma #{receipt_data['order_id'][-6:]} avtomatik qabul qilindi!",
+                f"✅ Buyurtma #{receipt_data['order_id'][-6:]} to'lovi qabul qilindi!",
                 quote=True
             )
         except Exception as e:
@@ -1413,7 +1360,8 @@ async def health_handler(request):
         "service": "bodrum-bot",
         "timestamp": datetime.utcnow().isoformat(),
         "payme_receipt_parser": "enabled",
-        "auto_accept": "enabled"
+        "auto_accept": "enabled",
+        "payme_group_id": PAYME_GROUP_ID_INT
     }, headers=get_cors_headers())
 
 async def create_order_handler(request):
@@ -1653,7 +1601,7 @@ async def webhook_handler(request):
     return web.Response(text='OK')
 
 # ==========================================
-# MAIN
+# MAIN - TO'G'RILANGAN HANDLERLAR
 # ==========================================
 
 async def init_webhook(app):
@@ -1675,20 +1623,30 @@ async def init_webhook(app):
     
     application = Application.builder().token(TOKEN).build()
     
-    # Handlers
+    # ========== HANDLERS ==========
+    
+    # 1. Command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("myorders", myorders_command))
     
-    # ⭐⭐⭐ YANGI: Payme chek handler (guruh uchun)
-    # Guruhda xabarlar uchun
+    # 2. ⭐⭐⭐ TO'G'RILANGAN: Payme chek handler
+    # AVVAL: filters.ChatType.GROUPS - bu faqat supergroups uchun
+    # ENDI: filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP - ikkisi uchun ham
+    
+    # Guruhlardagi barcha matnli xabarlar uchun
     application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.GROUPS & filters.Regex(r'bodrum bot|Номер заказа|ORD_'),
+        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP),
         payme_receipt_handler
+    ), group=1)  # group=1 - boshqa handlerlardan oldin tekshirish
+    
+    # Shaxsiy chatlar uchun contact
+    application.add_handler(MessageHandler(
+        filters.CONTACT & filters.ChatType.PRIVATE,
+        contact_handler
     ))
     
-    # Shaxsiy chatlar uchun
-    application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    # Callback queries
     application.add_handler(CallbackQueryHandler(callback_handler))
     
     await application.initialize()
