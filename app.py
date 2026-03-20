@@ -361,6 +361,7 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
         logger.info(f"✅ Buyurtma topildi: {order_id}")
         
         # Buyurtma ma'lumotlarini yangilash
+        # Payme'dan kelgan ma'lumotlarni saqlaymiz (agar bo'lsa)
         updated_order = update_order_status(
             order_id,
             'pending_payment',  # To'lov qilingan, tasdiqlash kutilmoqda
@@ -381,15 +382,15 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
         # Admin ga xabar yuborish
         await notify_admin_payment_received(updated_order, bot)
         
-        # Mijozga xabar yuborish
+        # Mijozga xabar yuborish (agar tg_id bo'lsa)
         tg_id = order.get('tg_id')
         if tg_id and bot:
             try:
                 await bot.send_message(
                     chat_id=tg_id,
-                    text=f"✅ To'lovingiz qabul qilindi!\n\n"
-                         f"🆔 Buyurtma: #{order_id[-6:]}\n"
-                         f"💵 Summa: {receipt_data.get('amount', 0):,} so'm\n\n"
+                    text=f"✅ To'lovingiz qabul qilindi!\\n\\n"
+                         f"🆔 Buyurtma: #{order_id[-6:]}\\n"
+                         f"💵 Summa: {order.get('total', 0):,} so'm\\n\\n"
                          f"Buyurtmangiz tez orada qabul qilinadi."
                 )
                 logger.info(f"✅ Mijozga xabar yuborildi: {tg_id}")
@@ -403,14 +404,6 @@ async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
         import traceback
         traceback.print_exc()
         return False
-
-# ==========================================
-# GURUH HANDLER - TO'LIQ TO'G'RILANGAN
-# ==========================================
-
-# ==========================================
-# GURUH HANDLER - FAQAT ORDER ID TEKSHIRISH
-# ==========================================
 
 async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Payme cheklar kelganda - FAQAT ORDER ID tekshiradi"""
@@ -757,11 +750,11 @@ async def notify_admin_payment_received(order: Dict, bot=None):
     """
     try:
         logger.info(f"🔔 notify_admin_payment_received: {order.get('order_id')}")
-        
+
         if not ADMIN_CHAT_ID_INT:
             logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
             return False
-        
+
         if bot is None:
             global application
             if application and application.bot:
@@ -769,24 +762,25 @@ async def notify_admin_payment_received(order: Dict, bot=None):
             else:
                 logger.error("❌ Bot mavjud emas!")
                 return False
-        
+
+        # Buyurtma ma'lumotlarini database'dan olish
         items = order.get('items', [])
         if isinstance(items, str):
             items = json.loads(items)
-        
+
         items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
-        
+
         raw_phone = order.get('phone', '')
         phone_display = format_phone_display(raw_phone)
-        
+
         customer_name = order.get('name', 'Mijoz')
         if not customer_name or customer_name == 'null':
             customer_name = 'Mijoz'
-        
+
         location = order.get('location')
         location_text = ""
         location_coords = None
-        
+
         if location and ',' in str(location):
             try:
                 lat, lng = str(location).split(',')
@@ -799,15 +793,16 @@ async def notify_admin_payment_received(order: Dict, bot=None):
                 location_text = f"\n📍 <b>Manzil:</b> {location}"
         elif location:
             location_text = f"\n📍 <b>Manzil:</b> {location}"
-        
+
+        # Payme'dan kelgan ma'lumotlar (agar bo'lsa)
         receipt_id = order.get('payme_receipt_id', 'N/A')
         card_mask = order.get('payme_card_mask', 'N/A')
-        
+
         source = order.get('source', 'website')
         source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
-        
+
         status_text = "💳 <b>TO'LOV QILINDI - QABUL QILISH KERAK!</b>"
-        
+
         admin_message = f"""{status_text}
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
@@ -831,14 +826,14 @@ async def notify_admin_payment_received(order: Dict, bot=None):
                 InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
             ]
         ]
-        
+
         admin_sent = await bot.send_message(
             chat_id=ADMIN_CHAT_ID_INT,
             text=admin_message,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
-        
+
         if location_coords and admin_sent:
             try:
                 await bot.send_location(
@@ -848,9 +843,9 @@ async def notify_admin_payment_received(order: Dict, bot=None):
                 )
             except Exception as e:
                 logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
-        
+
         return True
-        
+
     except Exception as e:
         logger.error(f"❌ notify_admin_payment_received xatosi: {e}")
         import traceback
