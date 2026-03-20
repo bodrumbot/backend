@@ -330,7 +330,7 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
 # ==========================================
 
 async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Payme cheklar kelganda - faqat ORD_ qidiradi"""
+    """Payme cheklar kelganda - DEBUG bilan"""
     try:
         message = update.message
         if not message or not message.text:
@@ -339,54 +339,99 @@ async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TY
         chat_id = message.chat_id
         text = message.text
         
-        # Log
-        logger.info(f"📩 Xabar qabul qilindi: chat_id={chat_id}")
-        logger.info(f"📝 Xabar matni: {text[:200]}...")
+        # ⭐ DEBUG: Har bir xabarni log qilish
+        logger.info(f"{'='*60}")
+        logger.info(f"📩 YANGI XABAR:")
+        logger.info(f"   Chat ID: {chat_id} (turi: {type(chat_id)})")
+        logger.info(f"   Guruh ID: {PAYME_GROUP_ID_INT} (turi: {type(PAYME_GROUP_ID_INT)})")
+        logger.info(f"   Text: {text[:100]}...")
         
-        # Faqat belgilangan guruhda ishlaydi
-        if PAYME_GROUP_ID_INT and chat_id != PAYME_GROUP_ID_INT:
-            logger.debug(f"⏭️ Boshqa chat: {chat_id} != {PAYME_GROUP_ID_INT}")
-            return
-        
-        # Asosiy tekshirish: ORD_ bormi? (case insensitive)
+        # 1. ORD_ mavjudligini tekshirish (avvaldan)
         if not re.search(r'ORD_', text, re.IGNORECASE):
-            logger.debug("⏭️ ORD_ pattern topilmadi")
+            logger.info("⏭️ ORD_ topilmadi")
             return
         
-        logger.info(f"✅ ORD_ pattern aniqlandi! Parse qilinmoqda...")
+        logger.info("✅ ORD_ pattern aniqlandi!")
         
-        # Parse qilish
+        # 2. Chat ID tekshiruvi - STRING sifatida solishtirish
+        # Ba'zan -100123 va -1001234567890 farq qiladi
+        chat_id_str = str(chat_id)
+        group_id_str = str(PAYME_GROUP_ID_INT)
+        
+        logger.info(f"   String solishtirish: {chat_id_str} == {group_id_str}")
+        
+        # Agar to'liq mos kelmasa, -100 qo'shimchasini tekshirish
+        ids_match = False
+        if chat_id == PAYME_GROUP_ID_INT:
+            ids_match = True
+        elif chat_id_str == group_id_str:
+            ids_match = True
+        elif group_id_str in chat_id_str or chat_id_str in group_id_str:
+            ids_match = True
+        
+        if not ids_match:
+            logger.warning(f"❌ Chat ID mos EMAS: {chat_id} != {PAYME_GROUP_ID_INT}")
+            return
+        
+        logger.info("✅ Chat ID mos keldi!")
+        
+        # 3. Parse qilish
         receipt_data = parse_payme_receipt(text)
         if not receipt_data:
-            logger.warning("❌ Chek parse qilinmadi")
+            logger.error("❌ parse_payme_receipt None qaytardi")
+            await message.reply_text("❌ Chek parse qilinmadi", quote=True)
             return
         
         order_id = receipt_data.get('order_id')
-        if not order_id:
-            logger.error("❌ ORDER ID yo'q")
-            return
-        
         logger.info(f"✅ ORDER ID: {order_id}")
         
-        # Buyurtmani qayta ishlash
-        success = await process_payme_receipt(receipt_data, context.bot)
+        # 4. Database'dan tekshirish
+        order = get_order(order_id)
+        if not order:
+            logger.error(f"❌ Buyurtma topilmadi: {order_id}")
+            await message.reply_text(
+                f"❌ Buyurtma topilmadi: {order_id}\n"
+                f"Database'da yo'q!",
+                quote=True
+            )
+            return
+        
+        logger.info(f"✅ Buyurtma database'dan olindi")
+        
+        # 5. Yangilash
+        updated_order = update_order_status(
+            order_id,
+            'pending_payment',
+            payment_status='paid',
+            paid_at=datetime.utcnow().isoformat(),
+            transaction_id=receipt_data.get('transaction_id'),
+            payme_receipt_id=receipt_data.get('receipt_id'),
+            payme_card_mask=receipt_data.get('card_mask'),
+            notified=False
+        )
+        
+        if not updated_order:
+            logger.error("❌ update_order_status xato")
+            return
+        
+        # 6. Adminga yuborish
+        success = await notify_admin_payment_received(updated_order, context.bot)
         
         if success:
-            try:
-                await message.reply_text(
-                    f"✅ Buyurtma #{order_id[-6:]} to'lovi qabul qilindi!",
-                    quote=True
-                )
-                logger.info(f"✅ Javob yuborildi")
-            except Exception as e:
-                logger.warning(f"⚠️ Javob yuborishda xato: {e}")
+            await message.reply_text(
+                f"✅ Buyurtma #{order_id[-6:]} qabul qilindi!",
+                quote=True
+            )
         else:
-            logger.error(f"❌ Buyurtma qayta ishlanmadi: {order_id}")
+            await message.reply_text(
+                f"⚠️ Buyurtma saqlandi lekin adminga yuborilmadi",
+                quote=True
+            )
             
     except Exception as e:
         logger.error(f"❌ Handler xatosi: {e}")
         import traceback
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
 
 async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
     """Payme chekni qayta ishlash - faqat ORDER ID tekshiradi"""
