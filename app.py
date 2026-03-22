@@ -1424,9 +1424,15 @@ async def create_order_handler(request):
         
         if order:
             logger.info(f"✅ Buyurtma yaratildi: {order['order_id']}")
+            
+            # ⭐⭐⭐ DARHOL ADMINGA XABAR YUBORISH
+            # To'lovni tekshirmay, darhol xabar yuborish
+            asyncio.create_task(notify_admin_new_order(order))
+            
             return web.json_response({
                 **order,
-                "message": "Buyurtma yaratildi. To'lov qilinganda avtomatik qabul qilinadi."
+                "message": "Buyurtma yaratildi. To'lovni amalga oshiring.",
+                "payme_url": f"https://checkout.payme.uz/{os.getenv('PAYME_MERCHANT_ID')}?orderId={order['order_id']}&amount={order['total'] * 100}"
             }, status=201, headers=get_cors_headers())
         else:
             return web.json_response({"error": "Failed to create order"}, status=500, headers=get_cors_headers())
@@ -1436,6 +1442,113 @@ async def create_order_handler(request):
         import traceback
         traceback.print_exc()
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
+
+async def notify_admin_new_order(order: Dict):
+    """
+    Admin ga YANGI BUYURTMA haqida xabar (to'lov tekshirilmagan)
+    """
+    try:
+        logger.info(f"🔔 Yangi buyurtma admin ga: {order.get('order_id')}")
+
+        if not ADMIN_CHAT_ID_INT:
+            logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
+            return False
+
+        global application
+        if not application or not application.bot:
+            logger.error("❌ Bot mavjud emas!")
+            return False
+        
+        bot = application.bot
+
+        # Buyurtma ma'lumotlarini olish
+        items = order.get('items', [])
+        if isinstance(items, str):
+            items = json.loads(items)
+
+        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+
+        raw_phone = order.get('phone', '')
+        phone_display = format_phone_display(raw_phone)
+
+        customer_name = order.get('name', 'Mijoz')
+        if not customer_name or customer_name == 'null':
+            customer_name = 'Mijoz'
+
+        location = order.get('location')
+        location_text = ""
+        location_coords = None
+
+        if location and ',' in str(location):
+            try:
+                lat, lng = str(location).split(',')
+                lat = float(lat.strip())
+                lng = float(lng.strip())
+                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+                location_coords = (lat, lng)
+            except Exception as e:
+                logger.warning(f"Joylashuv parse xatosi: {e}")
+                location_text = f"\n📍 <b>Manzil:</b> {location}"
+        elif location:
+            location_text = f"\n📍 <b>Manzil:</b> {location}"
+
+        source = order.get('source', 'website')
+        source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
+
+        # ⭐ YANGI: To'lov kutilmoqda statusi
+        status_text = "⏳ <b>YANGI BUYURTMA - TO'LOV KUTILMOQDA!</b>"
+
+        admin_message = f"""{status_text}
+
+🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
+👤 Mijoz: {customer_name}
+📞 Telefon: {phone_display}
+💵 Summa: {format_price(order.get('total', 0))} so'm
+📱 Manba: {source_icon}{location_text}
+
+🍽 Mahsulotlar:
+{items_text}
+
+⏰ {datetime.now().strftime('%H:%M:%S')}
+
+<i>⚡ To'lovni tekshiring, keyin qabul qiling yoki bekor qiling</i>"""
+
+        # ⭐⭐⭐ 3 TA TUGMA: Qabul, Bekor, To'lovni tekshirish
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
+                InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
+            ],
+            [
+                InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
+            ]
+        ])
+
+        admin_sent = await bot.send_message(
+            chat_id=ADMIN_CHAT_ID_INT,
+            text=admin_message,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+
+        if location_coords and admin_sent:
+            try:
+                await bot.send_location(
+                    chat_id=ADMIN_CHAT_ID_INT,
+                    latitude=location_coords[0],
+                    longitude=location_coords[1]
+                )
+            except Exception as e:
+                logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
+
+        logger.info(f"✅ Admin ga xabar yuborildi: {order.get('order_id')}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ notify_admin_new_order xatosi: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 async def get_order_handler(request):
     try:
@@ -1668,8 +1781,6 @@ async def init_webhook(app):
             webhook_url = f"https://{railway_domain}"
     
     application = Application.builder().token(TOKEN).build()
-    
-    # ========== HANDLERS ==========
     
     # 1. Command handlers
     application.add_handler(CommandHandler("start", start))
