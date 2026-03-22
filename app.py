@@ -637,14 +637,17 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         
         update_data = {'status': status}
         
-        # Timestamp fieldlar
+        # ⭐⭐⭐ TIMESTAMP FIELDLAR - BARCHA STATUSLAR UCHUN
         timestamp_fields = {
             'accepted': 'accepted_at',
             'rejected': 'rejected_at', 
-            'confirmed': 'confirmed_at'
+            'confirmed': 'confirmed_at',
+            'pending_payment': None,  # Faqat status o'zgaradi
+            'pending': None
         }
         
-        if status in timestamp_fields:
+        # Statusga mos timestamp ni qo'shish
+        if status in timestamp_fields and timestamp_fields[status]:
             field_name = timestamp_fields[status]
             cur.execute(f"""
                 SELECT column_name 
@@ -653,6 +656,17 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
             """)
             if cur.fetchone():
                 update_data[field_name] = datetime.utcnow().isoformat()
+        
+        # Agar confirmed bo'lsa va avval accepted bo'lmasa, accepted_at ham qo'shish
+        if status == 'confirmed':
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'orders' AND column_name = 'accepted_at'
+            """)
+            if cur.fetchone():
+                # Avval accepted_at bo'lmasa, hozir qo'shish
+                update_data['accepted_at'] = datetime.utcnow().isoformat()
         
         # paid_at alohida
         if kwargs.get('paid_at'):
@@ -670,7 +684,7 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         
         # Qolgan fieldlar
         for key, val in kwargs.items():
-            if val is not None and key not in ['paid_at', 'notified']:
+            if val is not None and key not in ['paid_at', 'notified', 'accepted_at', 'confirmed_at', 'rejected_at']:
                 update_data[key] = val
         
         fields = []
@@ -696,14 +710,14 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
         
     except Exception as e:
         logger.error(f"Update error: {e}")
+        import traceback
+        traceback.print_exc()
         if conn:
             conn.rollback()
         return None
     finally:
         if conn:
             conn.close()
-
-
 
 async def notify_admin_payment_received(order: Dict, bot=None):
     """
@@ -1093,7 +1107,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = data.replace("open_payme_group_", "")
         
         # Guruhga o'tish linkini yaratish
-        payme_group_username = os.getenv("PAYME_GROUP_USERNAME", "payme_receipts_group")
+        payme_group_username = os.getenv("PAYME_GROUP_USERNAME", "bodrumbota")
         group_link = f"https://t.me/{payme_group_username}"
         
         # Inline keyboard
@@ -1179,8 +1193,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # ⭐⭐⭐ BUYURTMANI QABUL QILISH / BEKOR QILISH
-    if data.startswith(("accept_", "reject_")):
+    # ⭐⭐⭐ BUYURTMANI QABUL QILISH / BEKOR QILISH / TASDIQLASH
+    if data.startswith(("accept_", "reject_", "confirm_")):
         action, order_id = data.split("_", 1)
         order = get_order(order_id)
         
@@ -1192,11 +1206,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=user.id, text="❌ Buyurtma topilmadi!")
             return
         
-        new_status = 'accepted' if action == 'accept' else 'rejected'
+        # ⭐⭐⭐ STATUS NI ANIQ BELGILASH (TUZATILGAN)
+        # Dictionary orqali xarita (map) qilish - xatolikdan saqlanish uchun
+        status_map = {
+            'accept': 'accepted',
+            'reject': 'rejected',
+            'confirm': 'confirmed'
+        }
+        
+        new_status = status_map.get(action)
+        
+        # Agar noma'lum action bo'lsa (xavfsizlik uchun)
+        if not new_status:
+            logger.error(f"❌ Noma'lum action: {action}")
+            await query.edit_message_text("❌ Noma'lum amal!")
+            return
+        
+        # Statusni yangilash
         updated_order = update_order_status(order_id, new_status)
         
         if updated_order:
-            status_text = "✅ <b>QABUL QILINDI</b>" if action == 'accept' else "❌ <b>BEKOR QILINDI</b>"
+            # Statusga mos xabar matni
+            status_emojis = {
+                'accepted': '✅ <b>QABUL QILINDI</b>',
+                'rejected': '❌ <b>BEKOR QILINDI</b>',
+                'confirmed': '✅✅ <b>TASDIQLANDI</b>'
+            }
+            status_text = status_emojis.get(new_status, '❓ <b>Noma\'lum</b>')
             
             items = order.get('items', [])
             if isinstance(items, str):
@@ -1225,21 +1261,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Message edit error: {e}")
                 await context.bot.send_message(chat_id=user.id, text=message, parse_mode='HTML')
             
-            # Mijozga xabar yuborish
+            # ⭐⭐⭐ MIJOZGA XABAR YUBORISH (TO'LIQ TEKSHIRUV BILAN)
             tg_id = order.get('tg_id')
-            if tg_id:
+            logger.info(f"📨 Mijozga xabar yuborish: tg_id={tg_id}, status={new_status}")
+            
+            if tg_id and str(tg_id) not in ['0', 'None', '', 'null']:
                 try:
-                    if action == 'accept':
+                    if new_status == 'accepted':
                         msg = f"✅ Buyurtmangiz #{order_id[-6:]} qabul qilindi!\n\nTez orada yetkazib beramiz! 🚀"
-                    else:
+                    elif new_status == 'confirmed':
+                        msg = f"✅✅ Buyurtmangiz #{order_id[-6:]} tasdiqlandi!\n\nBuyurtmangiz tayyorlanmoqda! 👨‍🍳"
+                    elif new_status == 'rejected':
                         msg = f"❌ Buyurtmangiz #{order_id[-6:]} bekor qilindi.\n\nQo'llab-quvvatlash: +998901234567"
+                    else:
+                        msg = f"ℹ️ Buyurtmangiz #{order_id[-6:]} statusi yangilandi."
                     
-                    await context.bot.send_message(chat_id=tg_id, text=msg)
+                    await context.bot.send_message(chat_id=int(tg_id), text=msg, parse_mode='HTML')
+                    logger.info(f"✅ Mijozga xabar yuborildi: {tg_id}")
                 except Exception as e:
-                    logger.error(f"Mijozga xabar yuborishda xato: {e}")
+                    logger.error(f"❌ Mijozga xabar yuborishda xato: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                logger.warning(f"⚠️ Mijoz tg_id yo'q yoki noto'g'ri: {tg_id}")
         else:
             try:
-                await query.edit_message_text("❌ Xatolik yuz berdi!")
+                await query.edit_message_text("❌ Xatolik yuz berdi! Ma'lumotlar bazasida yangilanmadi.")
             except Exception as e:
                 logger.warning(f"Message edit error: {e}")
                 await context.bot.send_message(chat_id=user.id, text="❌ Xatolik yuz berdi!")
@@ -1425,10 +1472,9 @@ async def create_order_handler(request):
         if order:
             logger.info(f"✅ Buyurtma yaratildi: {order['order_id']}")
             
-            # ⭐⭐⭐ DARHOL ADMINGA XABAR YUBORISH
-            # To'lovni tekshirmay, darhol xabar yuborish
+            # ⭐⭐⭐ DARHOL ADMINGA XABAR YUBORISH (TO'G'RI FUNKSIYA)
             try:
-                # Asinxron xabar yuborish
+                # ASINXRON XABAR YUBORISH - notify_admin_new_order chaqiriladi
                 asyncio.create_task(notify_admin_new_order(order))
                 logger.info(f"📨 Admin ga xabar yuborildi: {order['order_id']}")
             except Exception as e:
@@ -1572,15 +1618,25 @@ async def get_order_handler(request):
         return web.json_response({"error": str(e)}, status=500, headers=get_cors_headers())
 
 async def orders_list_handler(request):
-    """Barcha buyurtmalarni olish - FAQAT QABUL QILINGANLAR"""
+    """Barcha buyurtmalarni olish - BARCHA STATUSLAR"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        
+        # ⭐⭐⭐ BARCHA STATUSLARNI OLIB QAYTARISH (filtr olib tashlandi)
         cur.execute("""
             SELECT * FROM orders 
-            WHERE status = 'accepted' 
-            ORDER BY accepted_at DESC NULLS LAST, created_at DESC 
-            LIMIT 100
+            ORDER BY 
+                CASE 
+                    WHEN status = 'pending_payment' THEN 1
+                    WHEN status = 'pending' THEN 2
+                    WHEN status = 'accepted' THEN 3
+                    WHEN status = 'confirmed' THEN 4
+                    WHEN status = 'rejected' THEN 5
+                    ELSE 6
+                END,
+                created_at DESC 
+            LIMIT 200
         """)
         results = cur.fetchall()
         cur.close()
