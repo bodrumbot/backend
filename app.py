@@ -324,179 +324,113 @@ def parse_payme_receipt(text: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"❌ Chek parse xatosi: {e}")
         return None
+        
+
 
 # ==========================================
-# PAYME CHEK HANDLER - SODDALASHTIRILGAN
+# PAYME GURUHIGA O'TISH VA TEKSHIRISH
 # ==========================================
 
-async def payme_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Payme cheklar kelganda - DEBUG bilan"""
-    try:
-        message = update.message
-        if not message or not message.text:
-            return
-        
-        chat_id = message.chat_id
-        text = message.text
-        
-        # ⭐ DEBUG: Har bir xabarni log qilish
-        logger.info(f"{'='*60}")
-        logger.info(f"📩 YANGI XABAR:")
-        logger.info(f"   Chat ID: {chat_id} (turi: {type(chat_id)})")
-        logger.info(f"   Guruh ID: {PAYME_GROUP_ID_INT} (turi: {type(PAYME_GROUP_ID_INT)})")
-        logger.info(f"   Text: {text[:100]}...")
-        
-        # 1. ORD_ mavjudligini tekshirish (avvaldan)
-        if not re.search(r'ORD_', text, re.IGNORECASE):
-            logger.info("⏭️ ORD_ topilmadi")
-            return
-        
-        logger.info("✅ ORD_ pattern aniqlandi!")
-        
-        # 2. Chat ID tekshiruvi - STRING sifatida solishtirish
-        # Ba'zan -100123 va -1001234567890 farq qiladi
-        chat_id_str = str(chat_id)
-        group_id_str = str(PAYME_GROUP_ID_INT)
-        
-        logger.info(f"   String solishtirish: {chat_id_str} == {group_id_str}")
-        
-        # Agar to'liq mos kelmasa, -100 qo'shimchasini tekshirish
-        ids_match = False
-        if chat_id == PAYME_GROUP_ID_INT:
-            ids_match = True
-        elif chat_id_str == group_id_str:
-            ids_match = True
-        elif group_id_str in chat_id_str or chat_id_str in group_id_str:
-            ids_match = True
-        
-        if not ids_match:
-            logger.warning(f"❌ Chat ID mos EMAS: {chat_id} != {PAYME_GROUP_ID_INT}")
-            return
-        
-        logger.info("✅ Chat ID mos keldi!")
-        
-        # 3. Parse qilish
-        receipt_data = parse_payme_receipt(text)
-        if not receipt_data:
-            logger.error("❌ parse_payme_receipt None qaytardi")
-            await message.reply_text("❌ Chek parse qilinmadi", quote=True)
-            return
-        
-        order_id = receipt_data.get('order_id')
-        logger.info(f"✅ ORDER ID: {order_id}")
-        
-        # 4. Database'dan tekshirish
-        order = get_order(order_id)
-        if not order:
-            logger.error(f"❌ Buyurtma topilmadi: {order_id}")
-            await message.reply_text(
-                f"❌ Buyurtma topilmadi: {order_id}\n"
-                f"Database'da yo'q!",
-                quote=True
-            )
-            return
-        
-        logger.info(f"✅ Buyurtma database'dan olindi")
-        
-        # 5. Yangilash
-        updated_order = update_order_status(
-            order_id,
-            'pending_payment',
-            payment_status='paid',
-            paid_at=datetime.utcnow().isoformat(),
-            transaction_id=receipt_data.get('transaction_id'),
-            payme_receipt_id=receipt_data.get('receipt_id'),
-            payme_card_mask=receipt_data.get('card_mask'),
-            notified=False
+def get_payme_group_link(order_id: str) -> str:
+    """Payme guruhiga o'tish uchun link yaratish"""
+    # Guruh username yoki invite link
+    # O'zingizning guruh username ni yozing
+    PAYME_GROUP_USERNAME = "bodrumbota"  # O'zgartiring!
+    
+    # Order ID ni qidirish uchun guruhga o'tish
+    # Telegram deep link orqali guruhga o'tish va qidirish
+    return f"https://t.me/{PAYME_GROUP_USERNAME}?q={order_id}"
+
+async def open_payme_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Payme guruhiga o'tish tugmasi handleri"""
+    query = update.callback_query
+    await query.answer()
+    
+    order_id = query.data.replace("open_payme_group_", "")
+    
+    # Guruhga o'tish linkini yaratish
+    group_link = get_payme_group_link(order_id)
+    
+    # Inline keyboard bilan guruhga o'tish tugmasi
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Payme guruhiga o'tish", url=group_link)],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_order_{order_id}")]
+    ])
+    
+    await query.edit_message_text(
+        f"💳 <b>To'lovni tekshirish</b>\n\n"
+        f"🆔 Buyurtma: #{order_id[-6:]}\n\n"
+        f"Payme guruhiga o'tib, quyidagi ORDER ID ni qidiring:\n"
+        f"<code>{order_id}</code>\n\n"
+        f"To'lov topilsa, qaytib kelib \"Qabul qilish\" ni bosing.",
+        reply_markup=keyboard,
+        parse_mode='HTML'
+    )
+
+async def show_order_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, order: Dict):
+    """Buyurtma ma'lumotlarini admin ga qayta ko'rsatish"""
+    items = order.get('items', [])
+    if isinstance(items, str):
+        items = json.loads(items)
+    
+    items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+    
+    raw_phone = order.get('phone', '')
+    phone_display = format_phone_display(raw_phone)
+    
+    location = order.get('location')
+    location_text = ""
+    if location and ',' in str(location):
+        try:
+            lat, lng = str(location).split(',')
+            lat = float(lat.strip())
+            lng = float(lng.strip())
+            location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+        except:
+            pass
+    
+    status_text = "💳 <b>TO'LOV QILINDI - QABUL QILISH KERAK!</b>"
+    
+    message = f"""{status_text}
+
+🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
+👤 Mijoz: {order.get('name')}
+📞 Telefon: {phone_display}
+💵 Summa: {format_price(order.get('total', 0))} so'm
+💳 Karta: {order.get('payme_card_mask', 'N/A')}
+🧾 Chek ID: {order.get('payme_receipt_id', 'N/A')}
+📱 Manba: {'🤖 WebApp' if order.get('source') == 'webapp' else '🌐 Sayt'}{location_text}
+
+🍽 Mahsulotlar:
+{items_text}
+
+⏰ {datetime.now().strftime('%H:%M:%S')}
+
+<i>⚡ To'lov muvaffaqiyatli! Buyurtmani qabul qiling yoki bekor qiling</i>"""
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
+            InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
+        ],
+        [
+            InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
+        ]
+    ]
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
         )
-        
-        if not updated_order:
-            logger.error("❌ update_order_status xato")
-            return
-        
-        # 6. Adminga yuborish
-        success = await notify_admin_payment_received(updated_order, context.bot)
-        
-        if success:
-            await message.reply_text(
-                f"✅ Buyurtma #{order_id[-6:]} qabul qilindi!",
-                quote=True
-            )
-        else:
-            await message.reply_text(
-                f"⚠️ Buyurtma saqlandi lekin adminga yuborilmadi",
-                quote=True
-            )
-            
-    except Exception as e:
-        logger.error(f"❌ Handler xatosi: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-
-async def process_payme_receipt(receipt_data: Dict, bot) -> bool:
-    """Payme chekni qayta ishlash - faqat ORDER ID tekshiradi"""
-    try:
-        order_id = receipt_data.get('order_id')
-        if not order_id:
-            logger.error("❌ ORDER ID yo'q")
-            return False
-        
-        logger.info(f"🔄 Buyurtma qidirilmoqda: {order_id}")
-        
-        # Buyurtmani topish
-        order = get_order(order_id)
-        if not order:
-            logger.warning(f"⚠️ Buyurtma topilmadi: {order_id}")
-            return False
-        
-        logger.info(f"✅ Buyurtma topildi: {order_id}")
-        
-        # Buyurtma ma'lumotlarini yangilash
-        # Payme'dan kelgan ma'lumotlarni saqlaymiz (agar bo'lsa)
-        updated_order = update_order_status(
-            order_id,
-            'pending_payment',  # To'lov qilingan, tasdiqlash kutilmoqda
-            payment_status='paid',
-            paid_at=datetime.utcnow().isoformat(),
-            transaction_id=receipt_data.get('transaction_id'),
-            payme_receipt_id=receipt_data.get('receipt_id'),
-            payme_card_mask=receipt_data.get('card_mask'),
-            notified=False
+    else:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID_INT,
+            text=message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
         )
-        
-        if not updated_order:
-            logger.error("❌ Buyurtma yangilash xatosi")
-            return False
-        
-        logger.info(f"✅ Buyurtma yangilandi: {order_id}")
-        
-        # Admin ga xabar yuborish
-        await notify_admin_payment_received(updated_order, bot)
-        
-        # Mijozga xabar yuborish (agar tg_id bo'lsa)
-        tg_id = order.get('tg_id')
-        if tg_id and bot:
-            try:
-                await bot.send_message(
-                    chat_id=tg_id,
-                    text=f"✅ To'lovingiz qabul qilindi!\\n\\n"
-                         f"🆔 Buyurtma: #{order_id[-6:]}\\n"
-                         f"💵 Summa: {order.get('total', 0):,} so'm\\n\\n"
-                         f"Buyurtmangiz tez orada qabul qilinadi."
-                )
-                logger.info(f"✅ Mijozga xabar yuborildi: {tg_id}")
-            except Exception as e:
-                logger.warning(f"⚠️ Mijozga xabar yuborishda xato: {e}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Process receipt xatosi: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
 
 def save_user_profile(tg_id: int, name: str, phone: str, username: str = None) -> bool:
     """Foydalanuvchi profilini saqlash yoki yangilash"""
@@ -773,10 +707,10 @@ def update_order_status(order_id: str, status: str, **kwargs) -> Optional[Dict[s
 
 async def notify_admin_payment_received(order: Dict, bot=None):
     """
-    Admin ga to'lov qilinganligi haqida xabar
+    Admin ga yangi buyurtma haqida xabar (to'lov tekshirilmagan)
     """
     try:
-        logger.info(f"🔔 notify_admin_payment_received: {order.get('order_id')}")
+        logger.info(f"🔔 notify_admin_new_order: {order.get('order_id')}")
 
         if not ADMIN_CHAT_ID_INT:
             logger.error("❌ ADMIN_CHAT_ID o'rnatilmagan!")
@@ -790,7 +724,7 @@ async def notify_admin_payment_received(order: Dict, bot=None):
                 logger.error("❌ Bot mavjud emas!")
                 return False
 
-        # Buyurtma ma'lumotlarini database'dan olish
+        # Buyurtma ma'lumotlarini olish
         items = order.get('items', [])
         if isinstance(items, str):
             items = json.loads(items)
@@ -821,14 +755,11 @@ async def notify_admin_payment_received(order: Dict, bot=None):
         elif location:
             location_text = f"\n📍 <b>Manzil:</b> {location}"
 
-        # Payme'dan kelgan ma'lumotlar (agar bo'lsa)
-        receipt_id = order.get('payme_receipt_id', 'N/A')
-        card_mask = order.get('payme_card_mask', 'N/A')
-
         source = order.get('source', 'website')
         source_icon = "🤖 WebApp" if source == 'webapp' else "🌐 Sayt"
 
-        status_text = "💳 <b>TO'LOV QILINDI - QABUL QILISH KERAK!</b>"
+        # ⭐ YANGI: To'lov kutilmoqda statusi
+        status_text = "⏳ <b>YANGI BUYURTMA - TO'LOV KUTILMOQDA!</b>"
 
         admin_message = f"""{status_text}
 
@@ -836,8 +767,6 @@ async def notify_admin_payment_received(order: Dict, bot=None):
 👤 Mijoz: {customer_name}
 📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 Karta: {card_mask}
-🧾 Chek ID: {receipt_id}
 📱 Manba: {source_icon}{location_text}
 
 🍽 Mahsulotlar:
@@ -845,19 +774,23 @@ async def notify_admin_payment_received(order: Dict, bot=None):
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}
 
-<i>⚡ To'lov muvaffaqiyatli! Buyurtmani qabul qiling yoki bekor qiling</i>"""
+<i>⚡ To'lovni tekshiring, keyin qabul qiling yoki bekor qiling</i>"""
 
-        keyboard = [
+        # ⭐⭐⭐ 3 TA TUGMA: Qabul, Bekor, To'lovni tekshirish
+        keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
                 InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
+            ],
+            [
+                InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
             ]
-        ]
+        ])
 
         admin_sent = await bot.send_message(
             chat_id=ADMIN_CHAT_ID_INT,
             text=admin_message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=keyboard,
             parse_mode='HTML'
         )
 
@@ -874,7 +807,7 @@ async def notify_admin_payment_received(order: Dict, bot=None):
         return True
 
     except Exception as e:
-        logger.error(f"❌ notify_admin_payment_received xatosi: {e}")
+        logger.error(f"❌ notify_admin_new_order xatosi: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -1100,8 +1033,11 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
 
         keyboard = [
             [
-                InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept_{order.get('order_id')}"),
-                InlineKeyboardButton("❌ Bekor qilish", callback_data=f"reject_{order.get('order_id')}")
+                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order.get('order_id')}"),
+                InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order.get('order_id')}")
+            ],
+            [
+                InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order.get('order_id')}")
             ]
         ]
         
@@ -1137,18 +1073,113 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user = update.effective_user
     
+    # Admin statistika
     if data == "admin_stats":
         await show_stats(update, context)
         return
     
+    # Yangi buyurtmalar ro'yxati
     if data == "show_new_orders":
         await show_new_orders_list(update, context)
         return
     
+    # Mijozning buyurtmalari
     if data == "my_orders":
         await show_user_orders(update, context)
         return
     
+    # ⭐⭐⭐ PAYME GURUHIGA O'TISH
+    if data.startswith("open_payme_group_"):
+        order_id = data.replace("open_payme_group_", "")
+        
+        # Guruhga o'tish linkini yaratish
+        payme_group_username = os.getenv("PAYME_GROUP_USERNAME", "payme_receipts_group")
+        group_link = f"https://t.me/{payme_group_username}"
+        
+        # Inline keyboard
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Payme guruhiga o'tish", url=group_link)],
+            [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_order_{order_id}")]
+        ])
+        
+        await query.edit_message_text(
+            f"💳 <b>To'lovni tekshirish</b>\n\n"
+            f"🆔 Buyurtma: #{order_id[-6:]}\n\n"
+            f"Quyidagi ORDER ID ni Payme guruhida qidiring:\n"
+            f"<code>{order_id}</code>\n\n"
+            f"To'lov topilsa, qaytib kelib <b>\"Qabul qilish\"</b> ni bosing.\n\n"
+            f"⚠️ To'lov topilmasa, buyurtma bekor qilinadi.",
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        return
+    
+    # ⭐⭐⭐ ORQAGA QAYTISH - BUYURTMANI QAYTA KO'RSATISH
+    if data.startswith("back_to_order_"):
+        order_id = data.replace("back_to_order_", "")
+        order = get_order(order_id)
+        
+        if not order:
+            await query.edit_message_text("❌ Buyurtma topilmadi!")
+            return
+        
+        # Buyurtma ma'lumotlarini qayta ko'rsatish
+        items = order.get('items', [])
+        if isinstance(items, str):
+            items = json.loads(items)
+        
+        items_text = "\n".join([f"• {i.get('name')} x{i.get('qty')}" for i in items]) if items else "Ma'lumot yo'q"
+        
+        raw_phone = order.get('phone', '')
+        phone_display = format_phone_display(raw_phone)
+        
+        location = order.get('location')
+        location_text = ""
+        if location and ',' in str(location):
+            try:
+                lat, lng = str(location).split(',')
+                lat = float(lat.strip())
+                lng = float(lng.strip())
+                location_text = f"\n📍 <b>Joylashuv:</b> <a href='https://maps.google.com/?q={lat},{lng}'>Xaritada ko'rish</a>"
+            except:
+                pass
+        
+        status_text = "⏳ <b>YANGI BUYURTMA - TO'LOV KUTILMOQDA!</b>"
+        
+        message = f"""{status_text}
+
+🆔 Buyurtma: #{order_id[-6:]}
+👤 Mijoz: {order.get('name')}
+📞 Telefon: {phone_display}
+💵 Summa: {format_price(order.get('total', 0))} so'm
+📱 Manba: {'🤖 WebApp' if order.get('source') == 'webapp' else '🌐 Sayt'}{location_text}
+
+🍽 Mahsulotlar:
+{items_text}
+
+⏰ {datetime.now().strftime('%H:%M:%S')}
+
+<i>⚡ To'lovni tekshiring, keyin qabul qiling yoki bekor qiling</i>"""
+
+        # ⭐ 3 TA TUGMA: Qabul, Bekor, To'lovni tekshirish
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ QABUL QILISH", callback_data=f"accept_{order_id}"),
+                InlineKeyboardButton("❌ BEKOR QILISH", callback_data=f"reject_{order_id}")
+            ],
+            [
+                InlineKeyboardButton("💳 TO'LOVNI TEKSHIRISH", callback_data=f"open_payme_group_{order_id}")
+            ]
+        ])
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        return
+    
+    # ⭐⭐⭐ BUYURTMANI QABUL QILISH / BEKOR QILISH
     if data.startswith(("accept_", "reject_")):
         action, order_id = data.split("_", 1)
         order = get_order(order_id)
@@ -1194,6 +1225,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Message edit error: {e}")
                 await context.bot.send_message(chat_id=user.id, text=message, parse_mode='HTML')
             
+            # Mijozga xabar yuborish
             tg_id = order.get('tg_id')
             if tg_id:
                 try:
@@ -1211,8 +1243,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Message edit error: {e}")
                 await context.bot.send_message(chat_id=user.id, text="❌ Xatolik yuz berdi!")
-
-# ⭐⭐⭐ TO'G'RILANGAN: PAYME CHEK HANDLER
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Statistika ko'rsatish"""
@@ -1640,32 +1670,26 @@ async def init_webhook(app):
     application = Application.builder().token(TOKEN).build()
     
     # ========== HANDLERS ==========
-    # Tartibi MUHIM: Guruh handlerlari birinchi, shaxsiy chatlar keyin
     
-    # 1. ⭐⭐⭐ PAYME CHEK HANDLER - Eng yuqori priority (group=0)
-    # Guruh va supergrouplar uchun
-    application.add_handler(MessageHandler(
-        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP),
-        payme_receipt_handler
-    ), group=0)  # group=0 - eng yuqori priority
-    
-    # 2. Command handlers
+    # 1. Command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("myorders", myorders_command))
     
-    # 3. Shaxsiy chatlar uchun contact
+    # 2. Shaxsiy chatlar uchun contact
     application.add_handler(MessageHandler(
         filters.CONTACT & filters.ChatType.PRIVATE,
         contact_handler
     ))
     
-    # 4. Callback queries
+    # 3. ⭐⭐⭐ CALLBACK QUERY HANDLER - Barcha callbacklar uchun
     application.add_handler(CallbackQueryHandler(callback_handler))
     
+    # Bot ni ishga tushirish
     await application.initialize()
     await application.start()
     
+    # Webhook o'rnatish
     if webhook_url:
         full_webhook_url = f"{webhook_url}/webhook"
         try:
@@ -1675,8 +1699,7 @@ async def init_webhook(app):
             logger.error(f"❌ Webhook xato: {e}")
     
     logger.info(f"🤖 Bot ishga tushdi!")
-    logger.info(f"💳 Payme chek parser faol: Guruh ID = {PAYME_GROUP_ID_INT}")
-    logger.info(f"⚡ Auto accept faol: To'lov qilingan buyurtmalar avtomatik qabul qilinadi")
+    logger.info(f"⚡ Admin tugmalari: Qabul, Bekor, To'lovni tekshirish")
 
 async def shutdown(app):
     global application
