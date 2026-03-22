@@ -1427,12 +1427,20 @@ async def create_order_handler(request):
             
             # ⭐⭐⭐ DARHOL ADMINGA XABAR YUBORISH
             # To'lovni tekshirmay, darhol xabar yuborish
-            asyncio.create_task(notify_admin_new_order(order))
+            try:
+                # Asinxron xabar yuborish
+                asyncio.create_task(notify_admin_new_order(order))
+                logger.info(f"📨 Admin ga xabar yuborildi: {order['order_id']}")
+            except Exception as e:
+                logger.error(f"❌ Admin ga xabar yuborish xatosi: {e}")
+            
+            # Payme URL ni qaytarish
+            payme_url = f"https://checkout.payme.uz/{os.getenv('PAYME_MERCHANT_ID')}?orderId={order['order_id']}&amount={order['total'] * 100}"
             
             return web.json_response({
                 **order,
                 "message": "Buyurtma yaratildi. To'lovni amalga oshiring.",
-                "payme_url": f"https://checkout.payme.uz/{os.getenv('PAYME_MERCHANT_ID')}?orderId={order['order_id']}&amount={order['total'] * 100}"
+                "payme_url": payme_url
             }, status=201, headers=get_cors_headers())
         else:
             return web.json_response({"error": "Failed to create order"}, status=500, headers=get_cors_headers())
