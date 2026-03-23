@@ -886,8 +886,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             formatted_phone = f"{phone[:2]} {phone[2:5]} {phone[5:7]} {phone[7:]}"
         
         keyboard = [
-            [InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))],
-            [InlineKeyboardButton("📋 Mening buyurtmalarim", callback_data="my_orders")]
+            [InlineKeyboardButton("🍽️ Menyuni ko'rish", web_app=WebAppInfo(url=WEBAPP_URL))]
         ]
         
         await update.message.reply_text(
@@ -1111,11 +1110,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"❌ show_new_orders xatosi: {e}")
             await query.edit_message_text("❌ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
-        return
-    
-    # Mijozning buyurtmalari
-    if data == "my_orders":
-        await show_user_orders(update, context)
         return
     
     # ⭐⭐⭐ PAYME GURUHIGA O'TISH
@@ -1384,84 +1378,8 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(text)
 
-async def myorders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Foydalanuvchining buyurtmalari"""
-    user = update.effective_user
-    
-    orders = get_user_orders(user.id)
-    
-    if not orders:
-        await update.message.reply_text(
-            "📭 <b>Sizda hali buyurtmalar yo'q</b>\n\n"
-            "🍽️ Menyudan buyurtma berish uchun /start ni bosing",
-            parse_mode='HTML'
-        )
-        return
-    
-    await show_user_orders(update, context, orders)
 
-async def show_user_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, orders=None):
-    """Foydalanuvchi buyurtmalarini ko'rsatish"""
-    user = update.effective_user
-    
-    if orders is None:
-        orders = get_user_orders(user.id)
-    
-    if not orders:
-        text = "📭 <b>Sizda hali buyurtmalar yo'q</b>"
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text, parse_mode='HTML')
-        else:
-            await update.message.reply_text(text, parse_mode='HTML')
-        return
-    
-    recent_orders = orders[:5]
-    
-    orders_text = "📋 <b>SIZNING BUYURTMALARINGIZ</b>\n\n"
-    
-    for i, order in enumerate(recent_orders, 1):
-        status_emoji = {
-            'accepted': '✅',
-            'rejected': '❌',
-            'pending': '⏳',
-            'pending_payment': '💳',
-            'confirmed': '✅'
-        }.get(order.get('status'), '❓')
-        
-        status_text = {
-            'accepted': 'Qabul qilingan',
-            'rejected': 'Bekor qilingan',
-            'pending': 'Kutilmoqda',
-            'pending_payment': 'To\'lov kutilmoqda',
-            'confirmed': 'Tasdiqlangan'
-        }.get(order.get('status'), 'Noma\'lum')
-        
-        order_id_short = order.get('order_id', 'N/A')[-6:]
-        total = format_price(order.get('total', 0))
-        created = order.get('created_at', '')[:10]
-        
-        orders_text += f"{i}. {status_emoji} <b>#{order_id_short}</b> - {total} so'm\n"
-        orders_text += f"   📅 {created} | {status_text}\n\n"
-    
-    if len(orders) > 5:
-        orders_text += f"... va yana {len(orders) - 5} ta buyurtma\n"
-    
-    keyboard = [
-        [InlineKeyboardButton("🍽️ Yangi buyurtma", web_app=WebAppInfo(url=WEBAPP_URL))]
-    ]
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            orders_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-    else:
-        await update.message.reply_text(
-            orders_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
+
 
 async def health_handler(request):
     return web.json_response({
@@ -1872,9 +1790,7 @@ async def init_webhook(app):
     
     # 1. COMMAND HANDLERS (avval)
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("myorders", myorders_command))
-    
+    application.add_handler(CommandHandler("stats", stats_command))    
     # 2. MESSAGE HANDLERS (Contact va boshqa xabarlar)
     application.add_handler(MessageHandler(
         filters.CONTACT & filters.ChatType.PRIVATE,
