@@ -975,12 +975,13 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        
+        # ⭐⭐⭐ TO'G'RILANDI - Yangi buyurtmalar: pending_payment statusida
         cur.execute("""
             SELECT * FROM orders 
-            WHERE payment_status = 'paid' 
-            AND status IN ('pending', 'pending_payment', 'accepted')
+            WHERE status IN ('pending_payment', 'pending')
             AND created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
-            ORDER BY paid_at DESC
+            ORDER BY created_at DESC
         """)
         results = cur.fetchall()
         cur.close()
@@ -1000,13 +1001,16 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
         if conn:
             conn.close()
     
+    # Agar yangi buyurtma bo'lmasa
     if not new_orders:
         await query.edit_message_text(
-            "📭 <b>Hozircha yangi to'lov qilingan buyurtmalar yo'q</b>",
+            "📭 <b>Hozircha yangi buyurtmalar yo'q</b>\n\n"
+            "Yangi buyurtmalar kelganda bu yerda ko'rinadi.",
             parse_mode='HTML'
         )
         return
     
+    # Har bir buyurtma uchun xabar yuborish
     for order in new_orders:
         items = order.get('items', [])
         if isinstance(items, str):
@@ -1030,20 +1034,20 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
             except:
                 pass
         
-        message = f"""🛎️ <b>YANGI TO'LOV QILINGAN BUYURTMA!</b>
+        message = f"""🛎️ <b>YANGI BUYURTMA!</b>
 
 🆔 Buyurtma: #{order.get('order_id', 'N/A')[-6:]}
 👤 Mijoz: {order.get('name')}
 📞 Telefon: {phone_display}
 💵 Summa: {format_price(order.get('total', 0))} so'm
-💳 To'lov: {order.get('payment_method', 'N/A').upper()} ✅{location_text}
+💳 To'lov: Kutilmoqda{location_text}
 
 🍽 Mahsulotlar:
 {items_text}
 
-⏰ {order.get('paid_at', order.get('created_at', datetime.now().isoformat()))[:19]}
+⏰ {order.get('created_at', datetime.now().isoformat())[:19]}
 
-<i>✅ To'lov muvaffaqiyatli - buyurtma qabul qilinishi kerak</i>"""
+<i>⏳ To'lovni tekshiring va buyurtmani qabul qiling</i>"""
 
         keyboard = [
             [
@@ -1073,8 +1077,9 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as e:
                 logger.error(f"❌ Joylashuv yuborish xatosi: {e}")
     
+    # Asosiy xabarni yangilash
     await query.edit_message_text(
-        f"📋 <b>{len(new_orders)} ta yangi to'lov qilingan buyurtma</b> yuborildi.\n"
+        f"📋 <b>{len(new_orders)} ta yangi buyurtma</b> yuborildi.\n"
         f"⏳ Ularni qabul qilish yoki bekor qilish mumkin.",
         parse_mode='HTML'
     )
@@ -1082,19 +1087,30 @@ async def show_new_orders_list(update: Update, context: ContextTypes.DEFAULT_TYP
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback query handler"""
     query = update.callback_query
-    await query.answer()
+    
+    # ⭐ MUHIM: Har doim answer() chaqirish
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.error(f"Query answer xatosi: {e}")
     
     data = query.data
     user = update.effective_user
+    
+    logger.info(f"👆 Callback query: {data} from user: {user.id}")
     
     # Admin statistika
     if data == "admin_stats":
         await show_stats(update, context)
         return
     
-    # Yangi buyurtmalar ro'yxati
+    # Yangi buyurtmalar ro'yxati - ⭐ TO'G'RILANDI
     if data == "show_new_orders":
-        await show_new_orders_list(update, context)
+        try:
+            await show_new_orders_list(update, context)
+        except Exception as e:
+            logger.error(f"❌ show_new_orders xatosi: {e}")
+            await query.edit_message_text("❌ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
         return
     
     # Mijozning buyurtmalari
@@ -1810,22 +1826,24 @@ async def get_user_profile_api(request):
             "error": str(e)
         }, status=500, headers=get_cors_headers())
 
+# webhook_handler ga log qo'shing
 async def webhook_handler(request):
     global application
     
     if application:
         try:
             data = await request.json()
+            logger.info(f"📩 Webhook data: {data}")  # ⭐ Log qo'shildi
+            
+            if 'callback_query' in data:
+                logger.info(f"👆 Callback query keldi: {data['callback_query']['data']}")
+            
             update = Update.de_json(data, application.bot)
             await application.process_update(update)
         except Exception as e:
             logger.error(f"Webhook processing error: {e}")
     
     return web.Response(text='OK')
-
-# ==========================================
-# MAIN - TO'G'RILANGAN HANDLERLAR
-# ==========================================
 
 async def init_webhook(app):
     global application
@@ -1837,6 +1855,7 @@ async def init_webhook(app):
     # Database ni initsializatsiya qilish
     if not init_database():
         logger.error("❌ Database initialization failed!")
+        return
     
     webhook_url = os.getenv("WEBHOOK_URL", "")
     if not webhook_url:
@@ -1844,37 +1863,56 @@ async def init_webhook(app):
         if railway_domain:
             webhook_url = f"https://{railway_domain}"
     
+    # Bot application yaratish
     application = Application.builder().token(TOKEN).build()
     
-    # 1. Command handlers
+    # ==========================================
+    # HANDLERLAR TARTIBI - MUHIM!
+    # ==========================================
+    
+    # 1. COMMAND HANDLERS (avval)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("myorders", myorders_command))
     
-    # 2. Shaxsiy chatlar uchun contact
+    # 2. MESSAGE HANDLERS (Contact va boshqa xabarlar)
     application.add_handler(MessageHandler(
         filters.CONTACT & filters.ChatType.PRIVATE,
         contact_handler
     ))
     
-    # 3. ⭐⭐⭐ CALLBACK QUERY HANDLER - Barcha callbacklar uchun
+    # 3. ⭐⭐⭐ CALLBACK QUERY HANDLER (MessageHandler DAN KEYIN!)
+    # Bu tartib MUHIM! MessageHandler CallbackQueryHandler dan oldin bo'lsa,
+    # callback query lar to'g'ri ishlamaydi
     application.add_handler(CallbackQueryHandler(callback_handler))
     
-    # Bot ni ishga tushirish
+    # ==========================================
+    # BOT NI ISHGA TUSHIRISH
+    # ==========================================
+    
     await application.initialize()
     await application.start()
     
-    # Webhook o'rnatish
+    # ==========================================
+    # WEBHOOK O'RNATISH
+    # ==========================================
+    
     if webhook_url:
         full_webhook_url = f"{webhook_url}/webhook"
         try:
-            await application.bot.set_webhook(full_webhook_url)
+            # ⭐ MUHIM: Callback query updates ni olish uchun allowed_updates
+            await application.bot.set_webhook(
+                url=full_webhook_url,
+                allowed_updates=['message', 'callback_query', 'inline_query', 'edited_message']
+            )
             logger.info(f"✅ Webhook o'rnatildi: {full_webhook_url}")
+            logger.info(f"✅ Allowed updates: message, callback_query, inline_query, edited_message")
         except Exception as e:
             logger.error(f"❌ Webhook xato: {e}")
     
     logger.info(f"🤖 Bot ishga tushdi!")
     logger.info(f"⚡ Admin tugmalari: Qabul, Bekor, To'lovni tekshirish")
+    logger.info(f"📦 Yangi buyurtmalar tugmasi ishga tushdi")
 
 async def shutdown(app):
     global application
